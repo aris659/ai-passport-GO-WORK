@@ -127,6 +127,9 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
         <span style="font-size:12px;color:var(--dim);margin-left:6px">背光模拟</span>
         <button class="seg on" id="blBtn" onclick="toggleBl()">开</button>
       </div>
+      <p style="font-size:11px;color:var(--dim);margin:6px 0 0">
+        真机行为：WiFi SNTP 同步成功后关闭 WiFi，每 6 小时重同步一次；
+        失败每 30 分钟重试；断网按"锚点 + 开机时长"推算走时。</p>
       <div class="row">
         <button class="seg" onclick="jumpEnd()">跳到结算（剩 2 秒）</button>
         <button class="seg" onclick="resetAll()">重置</button>
@@ -398,10 +401,19 @@ function drawIdleTexts(){
   const batt='87%'+(S.muted?' M':'');
   pixText(213-pixW(batt,2),5,2,batt,C_DIM);
   const today=stats.days[6];
-  const sum='TODAY '+today[0]+' WHIPS '+today[1]+' MIN';
-  pixText((240-pixW(sum,2))/2,176,2,sum,C_DIM);
+  const [sum,scale]=summaryFit(true,today[0],today[1],230);
+  pixText((240-pixW(sum,scale))/2,176,scale,sum,C_DIM);
   const pre='FOCUS '+FOCUS_MIN[S.idx]+' MIN';
   pixText((240-pixW(pre,3))/2,204,3,pre,C_RED);
+}
+/* 今日摘要自适应：与固件 pomo_summary_fit 同式
+ * 完整@2 -> 紧凑@2 -> 紧凑@1，防大数字横向溢出（240px 屏留 5px 边距） */
+function summaryFit(hasData,whips,minutes,maxPx){
+  const full=hasData?`TODAY ${whips} WHIPS ${minutes} MIN`:'TODAY -- WHIPS -- MIN';
+  if(pixW(full,2)<=maxPx)return[full,2];
+  const comp=hasData?`${whips} WHIPS ${minutes} MIN`:'-- WHIPS -- MIN';
+  if(pixW(comp,2)<=maxPx)return[comp,2];
+  return[comp,1];
 }
 function drawChart(){ /* 统计页 7 天柱状图 */
   let maxMin=1;
@@ -413,6 +425,17 @@ function drawChart(){ /* 统计页 7 天柱状图 */
     rect(31+i*27,182-h,15,h,color,1);
   }
   rect(25,184,190,2,C_TRK);
+  /* 星期字母：与柱序一致按实际日期滚动（today-6..today） */
+  const letters=weekdayLetters();
+  for(let i=0;i<7;i++)pixText(33+i*27,194,2,letters[i],C_DIM);
+}
+/* 本地 epoch 天数（UTC+8）与固件 pomo_weekday 同式：0=周一 */
+function weekdayLetters(){
+  const days=Math.floor((Date.now()+8*3600000)/86400000);
+  const L='MTWTFSS';
+  const out=[];
+  for(let i=0;i<7;i++)out.push(L[(days-6+i+3)%7]);
+  return out;
 }
 
 /* ===== 状态机（对应 pomodoro_model.c）===== */
@@ -547,7 +570,13 @@ function updateUI(){
     /* 统计页 */
     const today=stats.days[6];
     $('stToday').textContent='TODAY '+today[0]+' WHIPS '+today[1]+' MIN';
-    let wp=0,wm=0;stats.days.forEach(d=>{wp+=d[0];wm+=d[1];});
+    /* 本周合计：周一起算至今天（与固件 pomo_stats_week 一致） */
+    const days=Math.floor((Date.now()+8*3600000)/86400000);
+    const weekStart=days-((days+3)%7);
+    let wp=0,wm=0;
+    stats.days.forEach((d,i)=>{
+      if(days-6+i>=weekStart){wp+=d[0];wm+=d[1];}
+    });
     $('stWeek').textContent='WEEK '+wp+' WHIPS '+wm+' MIN';
     $('stAll').textContent='ALL '+stats.totalP+' WHIPS '+stats.totalM+' MIN';
   }

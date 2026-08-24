@@ -18,6 +18,19 @@
 
 一键回归：`bash tests/run_all_tests.sh`（无 ESP-IDF 依赖；Windows 主机可用 `docker run --rm -v <项目目录>:/src gcc:14 bash /src/tests/run_all_tests.sh`）。
 
+## Release Hardening（2026-08-25，v1.2.0）
+
+第一版公开发布前的收尾轮，只修 bug 不扩需求：
+
+| 项 | 内容 | 状态 |
+| --- | --- | --- |
+| H1 统计页 weekday 对齐 | 近 7 天柱序是 `today-6..today` 滚动窗口，星期标签从固定 `MTWTFSS` 改为 `pomo_weekday_letters()` 按实际日期生成 | 完成（test_date 新增周一周三周日用例） |
+| H2 闲时 TODAY 摘要溢出 | 新增 `pomo_summary_fit()`：完整文案@scale2 → 紧凑文案@scale2 → 紧凑文案@scale1 逐级退化，安全区 230px | 完成（test_date 新增拟合用例） |
+| H3 SNTP 重同步周期 | 正常同步成功后的重同步 1 小时 → 6 小时（省电）；失败重试仍为 30 分钟 | 完成 |
+| H4 WiFi/SNTP soft-fail | `pomodoro_time.c` 运行期全部 `ESP_ERROR_CHECK` 改为记日志+跳过本窗口：网络故障不再 abort 番茄钟本体 | 完成 |
+| H5 timer tick 与真实时间解耦 | 电池轮询等从 tick 计数改为 `now_ms()` 差值（GO WORK 动画临时切 40ms 周期不再失真）；GO WORK 计时变量统一 `uint64_t` | 完成 |
+| H6 文档与预览同步 | README / PRD / UI_PREVIEW 同步 6 小时重同步与上述行为；发布物升级 v1.2.0 | 完成 |
+
 ## T1 模型层：9 档时长与休息映射
 
 - 文件：`main/pomodoro_model.c`、`main/pomodoro_model.h`、`tests/test_pomodoro_model.c`
@@ -50,7 +63,7 @@
 - 新文件：`main/pomodoro_time.c/.h`、`main/wifi_config.h`；修改：`main/CMakeLists.txt`
 - 内容：
   - 三态 `pomo_time_status_t`（NONE/ESTIMATE/SYNCED）；`pomodoro_time_init(anchor)` 载入锚点并启动 WiFi 任务；`pomodoro_time_now_unix()` 在 SYNCED 时读系统时钟、否则 锚点+开机时长
-  - WiFi 任务：凭据为空直接退出；STA 连接（30 秒超时）→ SNTP（双服务器、60 秒同步间隔、同步回调置位）→ 同步后 10 秒关 WiFi；每小时开 60 秒重连窗口；连续失败每 30 分钟重试
+  - WiFi 任务：凭据为空直接退出；STA 连接（单凭据 15 秒超时）→ SNTP（双服务器、60 秒同步间隔、同步回调置位）→ 同步后关 WiFi；每 6 小时重同步一次；连续失败每 30 分钟重试；全程 soft-fail 不 abort
   - CMakeLists：REQUIRES 增加 `esp_wifi esp_netif esp_event lwip`
 - 完成标准：编译通过；上机填凭据后 30 秒内 SYNCED（真机项）
 

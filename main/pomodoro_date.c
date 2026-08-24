@@ -1,5 +1,6 @@
 #include "pomodoro_date.h"
 
+#include <stdio.h>
 #include <stddef.h>
 
 /* Howard Hinnant 的 civil 日期算法，days 为自 1970-01-01 起的天数。 */
@@ -39,6 +40,52 @@ uint8_t pomo_weekday(uint16_t days) {
 
 uint16_t pomo_week_start(uint16_t days) {
     return (uint16_t)(days - pomo_weekday(days));
+}
+
+void pomo_weekday_letters(uint16_t today, char out[7]) {
+    static const char L[7] = {'M', 'T', 'W', 'T', 'F', 'S', 'S'};
+    for (int i = 0; i < 7; i++) {
+        out[i] = L[pomo_weekday((uint16_t)(today - 6 + i))];
+    }
+}
+
+/* 5x7 像素字体宽度：advance = 6*scale，去尾部 gap。
+ * 须与 demo_pomodoro.c 的 pix_text_width 保持一致。 */
+static int pix_text_width(int n_chars, int scale) {
+    return n_chars > 0 ? n_chars * 6 * scale - scale : 0;
+}
+
+int pomo_summary_fit(char *buf, size_t cap, bool has_data,
+                     unsigned whips, unsigned minutes, int max_px) {
+    char full[40];
+    int n;
+    if (has_data) {
+        n = snprintf(full, sizeof(full), "TODAY %u WHIPS %u MIN", whips, minutes);
+    } else {
+        n = snprintf(full, sizeof(full), "TODAY -- WHIPS -- MIN");
+    }
+    if (n < 0) n = 0;
+    if (n < (int)sizeof(full) && pix_text_width(n, 2) <= max_px) {
+        snprintf(buf, cap, "%s", full);
+        return 2;
+    }
+
+    /* 完整文案 scale2 放不下：紧凑文案（去掉 TODAY 前缀）。 */
+    char comp[40];
+    if (has_data) {
+        n = snprintf(comp, sizeof(comp), "%u WHIPS %u MIN", whips, minutes);
+    } else {
+        n = snprintf(comp, sizeof(comp), "-- WHIPS -- MIN");
+    }
+    if (n < 0) n = 0;
+    if (n < (int)sizeof(comp) && pix_text_width(n, 2) <= max_px) {
+        snprintf(buf, cap, "%s", comp);
+        return 2;
+    }
+
+    /* 仍放不下：降为 scale1（uint16 极值 21 字符 = 125px，必然安全）。 */
+    snprintf(buf, cap, "%s", comp);
+    return 1;
 }
 
 int64_t pomo_time_estimate_unix(int64_t anchor_unix, uint64_t anchor_uptime_ms,

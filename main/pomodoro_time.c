@@ -24,7 +24,8 @@
 #define WIFI_POST_SYNC_KEEP_MS  (10 * 1000)
 #define WIFI_CONNECT_ATTEMPTS   3
 #define RETRY_AFTER_FAIL_MS     (30LL * 60 * 1000)
-#define RECHECK_PERIOD_MS       (60LL * 60 * 1000)
+/* 正常重同步周期 6 小时：番茄钟无亚秒级精度需求，减少 WiFi 唤醒省电。 */
+#define RECHECK_PERIOD_MS       (6LL * 60 * 60 * 1000)
 
 typedef struct {
     const char *ssid;
@@ -93,7 +94,9 @@ static void mark_synced(void) {
     ESP_LOGI(TAG, "Time synced via SNTP");
 }
 
-/* 一次完整尝试：遍历凭据表，逐个 连 WiFi -> SNTP 同步 -> 关闭。 */
+/* 一次完整尝试：遍历凭据表，逐个 连 WiFi -> SNTP 同步 -> 关闭。
+ * 网络是可选子系统：任一步失败只记录日志并返回 false，
+ * 保留既有 ESTIMATE/NONE 时间状态，等待下个重试窗口，绝不 abort。 */
 static bool try_cred_once(const wifi_cred_t *cred) {
     s_connect_attempts = 0;
 
@@ -104,8 +107,16 @@ static bool try_cred_once(const wifi_cred_t *cred) {
             sizeof(wifi_config.sta.password));
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
+        return false;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -135,7 +146,10 @@ static bool try_cred_once(const wifi_cred_t *cred) {
 
     xEventGroupClearBits(s_wifi_events,
                          WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    ESP_ERROR_CHECK(esp_wifi_stop());
+    err = esp_wifi_stop();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_stop failed: %s", esp_err_to_name(err));
+    }
     return synced;
 }
 
@@ -193,20 +207,44 @@ void pomodoro_time_init(int64_t anchor_unix) {
         return;
     }
 
-    /* 前置：pomodoro_store_init 已完成 nvs_flash_init。 */
-    ESP_ERROR_CHECK(esp_netif_init());
+    /* 前置：pomodoro_store_init 已完成 nvs_flash_init。
+     * WiFi 初始化失败属于可选子系统故障：记录日志、放弃时间同步，
+     * 番茄钟本体（计时/统计/交互）继续运行，不 abort。 */
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s; SNTP disabled",
+                 esp_err_to_name(err));
+        return;
+    }
     esp_event_loop_create_default();  /* 已存在时不视为错误 */
     esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    err = esp_wifi_init(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s; SNTP disabled",
+                 esp_err_to_name(err));
+        return;
+    }
+    err = esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    if (err == ESP_OK) {
+        err = esp_event_handler_instance_register(
+            IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi event register failed: %s; SNTP disabled",
+                 esp_err_to_name(err));
+        return;
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi mode/storage setup failed: %s; SNTP disabled",
+                 esp_err_to_name(err));
+        return;
+    }
 
     if (xTaskCreate(wifi_time_task, "pomo_time", 4096, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create time sync task");

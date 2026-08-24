@@ -85,6 +85,7 @@ static lv_obj_t *s_action_icon;
 /* 统计页元素 */
 static lv_obj_t *s_stats_today;
 static lv_obj_t *s_chart_layer;
+static lv_obj_t *s_stats_weekday[7];
 static lv_obj_t *s_stats_week;
 static lv_obj_t *s_stats_all;
 static uint16_t s_chart_min[7];
@@ -93,6 +94,7 @@ static lv_timer_t *s_timer;
 static bool s_stats_view;
 static uint64_t s_stats_open_ms;
 static int s_battery_soc = -1;
+static uint64_t s_last_battery_ms;
 static uint32_t s_last_sec = UINT32_MAX;
 static uint32_t s_last_minute = UINT32_MAX;
 static uint32_t s_save_bucket = UINT32_MAX;
@@ -116,8 +118,8 @@ typedef struct {
     uint8_t glitch;    /* 0=无 1/2=glitch 帧 */
 } gw_anim_t;
 static gw_anim_t s_gw;
-static uint32_t s_gw_next_ms;   /* 下次咆哮开始时刻 */
-static uint32_t s_gw_end_ms;    /* 当前咆哮结束时刻 */
+static uint64_t s_gw_next_ms;   /* 下次咆哮开始时刻 */
+static uint64_t s_gw_end_ms;    /* 当前咆哮结束时刻 */
 static bool s_gw_active;
 
 /* 计时屏血心状态 */
@@ -449,17 +451,15 @@ static void gowork_anim_update(uint64_t now_ms) {
     }
     if (!scene_ok) return;
 
-    uint32_t now = (uint32_t)now_ms;
-
-    if (now >= s_gw_next_ms) {
-        s_gw_next_ms = now + 2000;
-        s_gw_end_ms = now + 160;
+    if (now_ms >= s_gw_next_ms) {
+        s_gw_next_ms = now_ms + 2000;
+        s_gw_end_ms = now_ms + 160;
         s_gw_active = true;
         lv_timer_set_period(s_timer, 40);
     }
 
     if (s_gw_active) {
-        if (now >= s_gw_end_ms) {
+        if (now_ms >= s_gw_end_ms) {
             s_gw_active = false;
             s_gw.dx = s_gw.dy = 0;
             s_gw.glitch = 0;
@@ -467,7 +467,7 @@ static void gowork_anim_update(uint64_t now_ms) {
         } else {
             static const int8_t DX[4] = {2, -2, 1, 0};
             static const int8_t DY[4] = {0, 1, -1, 0};
-            uint32_t f = (now - (s_gw_end_ms - 160)) / 40;  /* 0..3 */
+            uint32_t f = (uint32_t)((now_ms - (s_gw_end_ms - 160)) / 40);
             if (f > 3) f = 3;
             s_gw.dx = DX[f];
             s_gw.dy = DY[f];
@@ -556,17 +556,14 @@ static void idle_clock_draw_cb(lv_event_t *event) {
         }
     }
 
-    /* 今日摘要 */
+    /* 今日摘要：数字变大时按 完整@2 -> 紧凑@2 -> 紧凑@1 退化，防横向溢出 */
     {
-        char buf[28];
-        if (s_idle_data_ok) {
-            snprintf(buf, sizeof(buf), "TODAY %u WHIPS %u MIN",
-                     (unsigned)s_idle_whips, (unsigned)s_idle_min);
-        } else {
-            snprintf(buf, sizeof(buf), "TODAY -- WHIPS -- MIN");
-        }
-        pix_text_draw(layer, &base, (240 - pix_text_width(buf, 2)) / 2,
-                      176, 2, buf, COLOR_DIM);
+        char buf[40];
+        int scale = pomo_summary_fit(buf, sizeof(buf), s_idle_data_ok,
+                                     s_idle_whips, s_idle_min, 230);
+        pix_text_draw(layer, &base,
+                      (240 - pix_text_width(buf, scale)) / 2, 176,
+                      scale, buf, COLOR_DIM);
     }
 
     /* 当前档位 */
@@ -902,6 +899,17 @@ static void refresh_stats_view(void) {
     pomo_day_rec_t week[7];
     pomo_stats_last7(&s_stats, today, week);
     for (int i = 0; i < 7; i++) s_chart_min[i] = week[i].focus_min;
+
+    /* 柱序 today-6..today 对应的星期字母（随实际日期滚动，非固定 MTWTFSS） */
+    char letters[7];
+    if (today != POMO_NO_DATE) {
+        pomo_weekday_letters(today, letters);
+        for (int i = 0; i < 7; i++) {
+            if (s_stats_weekday[i]) {
+                lv_label_set_text_fmt(s_stats_weekday[i], "%c", letters[i]);
+            }
+        }
+    }
     if (s_chart_layer) lv_obj_invalidate(s_chart_layer);
 }
 
@@ -1094,9 +1102,10 @@ static void timer_cb(lv_timer_t *timer) {
         set_stats_view(false);
     }
 
-    static uint32_t battery_ticks;
-    if (++battery_ticks >= 150) {
-        battery_ticks = 0;
+    /* 电池轮询基于真实时间而非 tick 计数：
+     * GO WORK 动画会把 timer 周期临时切到 40ms，tick 计数会失真。 */
+    if (time_ms - s_last_battery_ms >= 30ULL * 1000) {
+        s_last_battery_ms = time_ms;
         if (s_battery_ok) s_battery_soc = bsp_battery_soc();
         refresh_ui();
     }
@@ -1112,6 +1121,7 @@ void demo_pomodoro_enter(void) {
     s_save_bucket = UINT32_MAX;
     s_last_time_status = pomodoro_time_status();
     s_last_hourly_ms = now_ms();
+    s_last_battery_ms = now_ms();
     s_bl_scene = bl_scene_from_state();
     s_bl_ref_ms = now_ms();
     s_bl_current = 100;
@@ -1119,7 +1129,7 @@ void demo_pomodoro_enter(void) {
     s_gw.dx = s_gw.dy = 0;
     s_gw.glitch = 0;
     s_gw_active = false;
-    s_gw_next_ms = (uint32_t)now_ms() + 2000;
+    s_gw_next_ms = now_ms() + 2000;
     if (s_battery_ok) s_battery_soc = bsp_battery_soc();
 
     s_scr = lv_obj_create(NULL);
@@ -1174,9 +1184,10 @@ void demo_pomodoro_enter(void) {
     s_chart_layer = draw_layer_create(s_stats_layer, 25, 92, 190, 96,
                                       chart_draw_cb);
     for (int i = 0; i < 7; i++) {
-        lv_obj_t *wd = label(s_stats_layer, &lv_font_montserrat_14, COLOR_DIM);
-        lv_obj_set_pos(wd, 31 + i * 27, 194);
-        lv_label_set_text_fmt(wd, "%c", "MTWTFSS"[i]);
+        s_stats_weekday[i] = label(s_stats_layer, &lv_font_montserrat_14,
+                                   COLOR_DIM);
+        lv_obj_set_pos(s_stats_weekday[i], 31 + i * 27, 194);
+        lv_label_set_text(s_stats_weekday[i], "-");  /* 首刷时按日期填充 */
     }
     s_stats_week = centered_label(s_stats_layer, &lv_font_montserrat_14,
                                   COLOR_WHITE, 230);
@@ -1212,6 +1223,7 @@ void demo_pomodoro_exit(void) {
     s_mmss_label = s_state_label = s_action_icon = NULL;
     s_plus_label = s_done_label = NULL;
     s_stats_today = s_chart_layer = s_stats_week = s_stats_all = NULL;
+    for (int i = 0; i < 7; i++) s_stats_weekday[i] = NULL;
     s_stats_view = false;
     s_screen_off = false;
     s_bl_current = 100;
