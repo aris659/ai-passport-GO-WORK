@@ -1,0 +1,12 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+.vscode/
+
+# 本地 WiFi 凭据（首次构建自动从 wifi_config.example.h 生成，勿提交）
+main/wifi_config.h
+
+# 带真实凭据的自编译固件勿提交（默认发布物 whiplash-*.bin 为空凭据版，可提交）
+releases/*my-wifi*
