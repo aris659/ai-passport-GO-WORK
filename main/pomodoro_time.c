@@ -18,6 +18,7 @@
 #include "pomodoro_date.h"
 #include "pomodoro_stats.h"
 #include "wifi_config.h"
+#include "wifi_provision.h"
 
 #define WIFI_CONNECT_TIMEOUT_MS (15 * 1000)  /* 单凭据超时；多凭据总最坏 2x */
 #define WIFI_SYNC_WINDOW_MS     (60 * 1000)
@@ -26,20 +27,15 @@
 #define RETRY_AFTER_FAIL_MS     (30LL * 60 * 1000)
 /* 正常重同步周期 6 小时：番茄钟无亚秒级精度需求，减少 WiFi 唤醒省电。 */
 #define RECHECK_PERIOD_MS       (6LL * 60 * 60 * 1000)
+/* 拿驱动锁的等待上限：配网会话最长 5 分钟超时 + 余量。 */
+#define DRV_LOCK_TIMEOUT_MS     (8LL * 60 * 1000)
+
+#define MAX_CREDS 3  /* NVS 用户配置 1 条 + 编译期 wifi_config.h 2 条 */
 
 typedef struct {
-    const char *ssid;
-    const char *pass;
+    char ssid[33];
+    char pass[64];
 } wifi_cred_t;
-
-static const wifi_cred_t s_wifi_creds[] = {
-#if defined(POMO_WIFI_SSID_1)
-    { POMO_WIFI_SSID_1, POMO_WIFI_PASS_1 },
-#endif
-#if defined(POMO_WIFI_SSID_2)
-    { POMO_WIFI_SSID_2, POMO_WIFI_PASS_2 },
-#endif
-};
 
 static const char *TAG = "pomo_time";
 
@@ -50,8 +46,11 @@ static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static pomo_time_status_t s_status = POMO_TIME_NONE;
 static int64_t s_anchor_unix = 0;
 static uint64_t s_anchor_uptime_ms = 0;
+static volatile pomo_wifi_state_t s_wifi_state = POMO_WIFI_STATE_OFFLINE;
 
-static SemaphoreHandle_t s_sync_sem;
+static SemaphoreHandle_t s_sync_sem;   /* SNTP 完成信号 */
+static SemaphoreHandle_t s_drv_sem;    /* WiFi 驱动所有权：校时任务与配网会话互斥 */
+static SemaphoreHandle_t s_kick_sem;   /* 凭据变化：唤醒校时任务立即重试 */
 static EventGroupHandle_t s_wifi_events;
 static volatile uint8_t s_connect_attempts;
 
@@ -92,6 +91,44 @@ static void mark_synced(void) {
     s_status = POMO_TIME_SYNCED;
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "Time synced via SNTP");
+}
+
+/* 每轮尝试前重新装配凭据表：NVS 用户配置（SoftAP 配网）优先，
+ * 编译期 wifi_config.h 次之。配网保存后无需重启即可生效。 */
+static int load_creds(wifi_cred_t *out) {
+    int n = 0;
+    char ssid[33], pass[64];
+    if (pomo_wifi_user_creds_load(ssid, sizeof(ssid), pass, sizeof(pass)) &&
+        ssid[0] != '\0') {
+        strlcpy(out[n].ssid, ssid, sizeof(out[n].ssid));
+        strlcpy(out[n].pass, pass, sizeof(out[n].pass));
+        n++;
+    }
+#if defined(POMO_WIFI_SSID_1)
+    if (POMO_WIFI_SSID_1[0] != '\0' && n < MAX_CREDS) {
+        strlcpy(out[n].ssid, POMO_WIFI_SSID_1, sizeof(out[n].ssid));
+        strlcpy(out[n].pass, POMO_WIFI_PASS_1, sizeof(out[n].pass));
+        n++;
+    }
+#endif
+#if defined(POMO_WIFI_SSID_2)
+    if (POMO_WIFI_SSID_2[0] != '\0' && n < MAX_CREDS) {
+        strlcpy(out[n].ssid, POMO_WIFI_SSID_2, sizeof(out[n].ssid));
+        strlcpy(out[n].pass, POMO_WIFI_PASS_2, sizeof(out[n].pass));
+        n++;
+    }
+#endif
+    return n;
+}
+
+static bool has_build_creds(void) {
+#if defined(POMO_WIFI_SSID_1)
+    if (POMO_WIFI_SSID_1[0] != '\0') return true;
+#endif
+#if defined(POMO_WIFI_SSID_2)
+    if (POMO_WIFI_SSID_2[0] != '\0') return true;
+#endif
+    return false;
 }
 
 /* 一次完整尝试：遍历凭据表，逐个 连 WiFi -> SNTP 同步 -> 关闭。
@@ -153,23 +190,57 @@ static bool try_cred_once(const wifi_cred_t *cred) {
     return synced;
 }
 
-static bool try_sync_once(void) {
-    for (size_t i = 0; i < sizeof(s_wifi_creds) / sizeof(s_wifi_creds[0]); i++) {
-        if (s_wifi_creds[i].ssid[0] == '\0') continue;
-        ESP_LOGI(TAG, "Trying WiFi \"%s\"", s_wifi_creds[i].ssid);
-        if (try_cred_once(&s_wifi_creds[i])) return true;
+static bool try_sync_once(const wifi_cred_t *creds, int n) {
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "Trying WiFi \"%s\"", creds[i].ssid);
+        if (try_cred_once(&creds[i])) return true;
     }
     return false;
 }
 
+/* 常驻校时任务：成功后 6h 重同步，失败 30min 重试；
+ * 无凭据时休眠等配网 kick。驱动锁与配网会话互斥。 */
 static void wifi_time_task(void *arg) {
     (void)arg;
+    bool first = true;
     while (true) {
-        if (try_sync_once()) {
-            vTaskDelay(pdMS_TO_TICKS(RECHECK_PERIOD_MS));
+        wifi_cred_t creds[MAX_CREDS];
+        int n = 0;
+        if (first) {
+            first = false;
+            n = load_creds(creds);   /* 启动后立即首轮 */
+        } else {
+            TickType_t wait;
+            if (s_wifi_state == POMO_WIFI_STATE_CONNECTED) {
+                wait = pdMS_TO_TICKS(RECHECK_PERIOD_MS);
+            } else if (s_wifi_state == POMO_WIFI_STATE_OFFLINE) {
+                wait = portMAX_DELAY;   /* 无凭据：等配网保存唤醒 */
+            } else {
+                wait = pdMS_TO_TICKS(RETRY_AFTER_FAIL_MS);
+            }
+            xSemaphoreTake(s_kick_sem, wait);  /* 被 reload 提前唤醒 */
+            n = load_creds(creds);
+        }
+
+        if (n == 0) {
+            s_wifi_state = POMO_WIFI_STATE_OFFLINE;
+            continue;
+        }
+        if (xSemaphoreTake(s_drv_sem, pdMS_TO_TICKS(DRV_LOCK_TIMEOUT_MS)) !=
+            pdTRUE) {
+            ESP_LOGW(TAG, "WiFi driver busy; sync deferred");
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            continue;
+        }
+        s_wifi_state = POMO_WIFI_STATE_CONNECTING;
+        bool ok = try_sync_once(creds, n);
+        s_wifi_state = ok ? POMO_WIFI_STATE_CONNECTED
+                          : POMO_WIFI_STATE_FAILED;
+        xSemaphoreGive(s_drv_sem);
+        if (ok) {
+            ESP_LOGI(TAG, "Next SNTP resync in 6 h");
         } else {
             ESP_LOGW(TAG, "Time sync failed; retry in 30 min");
-            vTaskDelay(pdMS_TO_TICKS(RETRY_AFTER_FAIL_MS));
         }
     }
 }
@@ -191,18 +262,11 @@ void pomodoro_time_init(int64_t anchor_unix) {
         ESP_LOGI(TAG, "Time base: none");
     }
 
-    bool has_cred = false;
-    for (size_t i = 0; i < sizeof(s_wifi_creds) / sizeof(s_wifi_creds[0]); i++) {
-        if (s_wifi_creds[i].ssid[0] != '\0') { has_cred = true; break; }
-    }
-    if (!has_cred) {
-        ESP_LOGI(TAG, "WiFi credentials empty; SNTP disabled");
-        return;
-    }
-
     s_sync_sem = xSemaphoreCreateBinary();
     s_wifi_events = xEventGroupCreate();
-    if (!s_sync_sem || !s_wifi_events) {
+    s_drv_sem = xSemaphoreCreateMutex();
+    s_kick_sem = xSemaphoreCreateBinary();
+    if (!s_sync_sem || !s_wifi_events || !s_drv_sem || !s_kick_sem) {
         ESP_LOGE(TAG, "Failed to create sync primitives");
         return;
     }
@@ -246,8 +310,29 @@ void pomodoro_time_init(int64_t anchor_unix) {
         return;
     }
 
+    /* 配网模块：缓存 AP SSID + 创建会话任务（幂等） */
+    pomo_wifi_prov_early_init();
+
+    /* 凭据来源日志：NVS(用户配网) > 编译期 wifi_config.h > 无 */
+    bool nvs_has = pomo_wifi_user_creds_exist();
+    bool build_has = has_build_creds();
+    if (nvs_has) {
+        ESP_LOGI(TAG, "WiFi credential source: NVS (user provisioned)");
+    } else if (build_has) {
+        ESP_LOGI(TAG, "WiFi credential source: compile-time wifi_config.h");
+    } else {
+        ESP_LOGI(TAG, "WiFi credentials: none");
+    }
+
     if (xTaskCreate(wifi_time_task, "pomo_time", 4096, NULL, 3, NULL) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create time sync task");
+        return;
+    }
+
+    /* 公开固件无任何凭据：自动启动一次 SoftAP 配网。
+     * 用户可按 OK 关闭提示离线使用，AP 5 分钟无操作自动关闭。 */
+    if (!nvs_has && !build_has) {
+        pomo_wifi_prov_start();
     }
 }
 
@@ -276,4 +361,21 @@ uint16_t pomodoro_time_today(void) {
     int64_t now = pomodoro_time_now_unix();
     if (now <= 0) return POMO_NO_DATE;
     return pomo_date_from_unix(now);
+}
+
+pomo_wifi_state_t pomodoro_time_wifi_state(void) {
+    return s_wifi_state;
+}
+
+bool pomodoro_time_wifi_suspend(uint32_t timeout_ms) {
+    if (!s_drv_sem) return false;
+    return xSemaphoreTake(s_drv_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+}
+
+void pomodoro_time_wifi_resume(void) {
+    if (s_drv_sem) xSemaphoreGive(s_drv_sem);
+}
+
+void pomodoro_time_reload_credentials(void) {
+    if (s_kick_sem) xSemaphoreGive(s_kick_sem);
 }

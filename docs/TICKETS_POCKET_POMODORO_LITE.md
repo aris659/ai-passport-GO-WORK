@@ -31,6 +31,19 @@
 | H5 timer tick 与真实时间解耦 | 电池轮询等从 tick 计数改为 `now_ms()` 差值（GO WORK 动画临时切 40ms 周期不再失真）；GO WORK 计时变量统一 `uint64_t` | 完成 |
 | H6 文档与预览同步 | README / PRD / UI_PREVIEW 同步 6 小时重同步与上述行为；发布物升级 v1.2.0 | 完成 |
 
+## 真机修复 + SoftAP 配网（2026-08-25，v1.3.0）
+
+v1.2.0 首次真机烧录后的收尾轮：修 3 个真机问题 + 新增最小可用 SoftAP 配网。
+
+| 项 | 内容 | 状态 |
+| --- | --- | --- |
+| R1 电量运行时恢复 | 根因：`main.c` 启动时 `bsp_battery_init()` 一次失败即 `battery_ok=false` 永久关闭，且轮询分支 `if (s_battery_ok)` 不再重试。修复：demo 侧重试调度（失败后 1s/3s/10s，之后每 60s 一次；成功后正常 30s 读 SOC；读失败保留 `--%` 下轮再试），不再永久禁用 | 完成 |
+| R2 GO WORK!! 抽搐增强 | 根因：旧 4 帧 ±2px 位移不足一个 4px 字形像素块，真机几乎不可见。修复：6 帧 240ms 无 easing（DX +5/-6/+4/-3/+2/0，DY -2/+2/-1/+1/0/0），前两帧叠加 CRT 三段行撕裂（A: 顶+6/中-6/底+3；B: 顶-5/中+7/底-3）与 ±8px 红色残影，帧 0 顶行瞬时提亮近白；GO WORK 移入独立 240×56 小层（`s_gowork_layer`），咆哮只失效该层不再整屏重绘 | 完成 |
+| R3 ABANDON? 折行 | 根因：`s_state_label` 宽 70px 放不下 "ABANDON?"（montserrat_14 约 8 字符 ≈ 90px+）。修复：加宽至 150px + `LV_LABEL_LONG_CLIP`，PAUSE/RESUME/REST/ABANDON? 统一字体单行显示 | 完成 |
+| R4 SoftAP 配网 | 新模块 `wifi_provision.c/.h`（NVS namespace `whiplash_wifi` 存用户凭据 + SoftAP `WHIPLASH-XXXX` 开放热点 + 内嵌极简 HTTP 页 + 5 分钟无操作自动关 AP）与 `wifi_prov_util.c/.h`（纯逻辑：状态机/凭据校验/URL 解码/表单解析/AP SSID 生成，主机可测）；`pomodoro_time.c` 改造：凭据分级（NVS > 编译期）、WiFi 驱动互斥（`pomodoro_time_wifi_suspend/resume`）、常驻任务被 `pomodoro_time_reload_credentials()` 唤醒 | 完成 |
+| R5 配网 UI | 闲时覆盖横幅：ACTIVE 态显示 AP SSID 与 192.168.4.1，OK 可关横幅离线继续；保存后 15 分钟内显示连接结果（CONNECTING/WIFI OK TIME SYNCED/WIFI FAILED HOLD DOWN FOR SETUP）；闲时长按 DOWN 手动重新进入配网（不删旧凭据） | 完成 |
+| R6 测试与构建 | 新增 `tests/test_wifi_prov.c`（状态机转换/凭据校验边界/URL 解码/表单解析/AP SSID）；6 套主机测试全绿；ESP-IDF Docker 构建零错误；发布物 v1.3.0 merged.bin（空编译期凭据） | 完成 |
+
 ## T1 模型层：9 档时长与休息映射
 
 - 文件：`main/pomodoro_model.c`、`main/pomodoro_model.h`、`tests/test_pomodoro_model.c`

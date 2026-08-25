@@ -34,6 +34,6 @@ echo "=== Copying artifacts back ==="
 mkdir -p /src/build
 cp build/FoloToy-AI-Passport.bin /src/build/
 cp build/pomodoro-merged.bin /src/build/
-cp build/pomodoro-merged.bin "/src/releases/whiplash-esp32c3-v1.2.0-merged.bin"
+cp build/pomodoro-merged.bin "/src/releases/whiplash-esp32c3-v1.3.0-merged.bin"
 ls -la build/*.bin
 echo "BUILD_ARTIFACTS_DONE"

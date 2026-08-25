@@ -77,7 +77,7 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
           <div class="lbl" id="lTop"   style="left:9px;top:5px;font-size:14px;color:#777C85"></div>
           <div class="lbl" id="lBatt"  style="right:27px;top:5px;font-size:14px;color:#777C85"></div>
           <div class="lbl c" id="lMmss"  style="top:184px;font-size:48px;color:#F4F1E8"></div>
-          <div class="lbl" id="lState" style="left:42px;top:286px;width:70px;font-size:14px;color:#F02B24"></div>
+          <div class="lbl" id="lState" style="left:42px;top:286px;width:150px;font-size:14px;color:#F02B24;overflow:hidden"></div>
           <div class="lbl c" id="lPlus" style="top:88px;font-size:48px;color:#F4F1E8">+1</div>
           <div class="lbl c" id="lDone" style="top:196px;font-size:14px;color:#777C85">WHIP LANDED</div>
           <div id="statsLayer" style="position:absolute;inset:0;z-index:4;display:none">
@@ -86,6 +86,14 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
             <div class="lbl c" id="stWeek"  style="top:230px;font-size:14px;color:#F4F1E8"></div>
             <div class="lbl c" id="stAll"   style="top:254px;font-size:14px;color:#F4F1E8"></div>
             <div class="lbl c" id="stHint"  style="top:292px;font-size:14px;color:#777C85">OK: BACK</div>
+          </div>
+          <div id="wifiLayer" style="position:absolute;inset:0;z-index:5;display:none;background:#050608">
+            <div class="lbl c" id="wfTitle" style="top:60px;font-size:20px;color:#F02B24">WIFI SETUP</div>
+            <div class="lbl c" id="wfL1" style="top:112px;font-size:14px;color:#777C85">CONNECT:</div>
+            <div class="lbl c" id="wfL2" style="top:134px;font-size:14px;color:#F4F1E8">WHIPLASH-A3F2</div>
+            <div class="lbl c" id="wfL3" style="top:158px;font-size:14px;color:#777C85">OPEN:</div>
+            <div class="lbl c" id="wfL4" style="top:180px;font-size:14px;color:#F4F1E8">192.168.4.1</div>
+            <div class="lbl c" id="wfL5" style="top:226px;font-size:14px;color:#777C85">OK: OFFLINE</div>
           </div>
           <div id="dim"></div>
         </div>
@@ -105,6 +113,10 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
       <div class="dk">
         <button class="dkbtn" onclick="key('UP','DOUBLE')">双击 UP · 统计页</button>
         <button class="dkbtn" onclick="key('DOWN','DOUBLE')">双击 DOWN · 静音</button>
+      </div>
+      <div class="dk" style="margin-top:8px">
+        <button class="dkbtn" onclick="key('DOWN','LONG')">长按 DOWN · 重新配网</button>
+        <button class="dkbtn" onclick="key('OK','LONG')">长按 OK · 退出</button>
       </div>
     </div>
 
@@ -130,6 +142,18 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
       <p style="font-size:11px;color:var(--dim);margin:6px 0 0">
         真机行为：WiFi SNTP 同步成功后关闭 WiFi，每 6 小时重同步一次；
         失败每 30 分钟重试；断网按"锚点 + 开机时长"推算走时。</p>
+      <div class="row" style="margin-top:10px">
+        <span style="font-size:12px;color:var(--dim)">WiFi 配网模拟</span>
+        <button class="seg" onclick="setWifi('NONE')">有 WiFi</button>
+        <button class="seg" onclick="setWifi('SETUP')">NO WIFI</button>
+        <button class="seg" onclick="setWifi('SETUP')">SETUP</button>
+        <button class="seg" onclick="setWifi('OK')">CONNECTED</button>
+        <button class="seg" onclick="setWifi('FAILED')">FAILED</button>
+      </div>
+      <p style="font-size:11px;color:var(--dim);margin:6px 0 0">
+        NO WIFI / SETUP：无凭据开机自动弹横幅（时钟 --:--，按 OK 可关横幅离线继续）；
+        CONNECTED：保存后 SNTP 成功（WIFI OK / TIME SYNCED）；FAILED：密码错或 5G（WIFI FAILED / HOLD DOWN FOR SETUP）。
+        真机链路：手机连 WHIPLASH-XXXX 热点 → 打开 192.168.4.1 → 填 WiFi → SAVE & CONNECT。</p>
       <div class="row">
         <button class="seg" onclick="jumpEnd()">跳到结算（剩 2 秒）</button>
         <button class="seg" onclick="resetAll()">重置</button>
@@ -144,6 +168,7 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
         <span class="k">本轮</span><span class="v" id="svRound">1/4</span>
         <span class="k">待休息</span><span class="v" id="svBreak">—</span>
         <span class="k">背光</span><span class="v" id="svBl">100%</span>
+        <span class="k">WiFi</span><span class="v" id="svWifi">在线</span>
       </div>
     </div>
 
@@ -152,6 +177,7 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
       <table class="tbl">
         <tr><th>状态</th><th>UP</th><th>DOWN</th><th>OK</th></tr>
         <tr><td>闲时</td><td>上一档</td><td>下一档</td><td>开始专注</td></tr>
+        <tr><td>闲时（配网横幅）</td><td>—</td><td>—</td><td>关横幅离线继续</td></tr>
         <tr><td>专注中</td><td>—</td><td>—</td><td>暂停</td></tr>
         <tr><td>已暂停</td><td>发起放弃</td><td>—</td><td>继续</td></tr>
         <tr><td>放弃确认</td><td>确认放弃</td><td>取消</td><td>取消</td></tr>
@@ -162,6 +188,11 @@ select{background:#0f1216;color:var(--txt);border:1px solid var(--line);border-r
       <p class="note" style="margin-top:10px">
         息屏后任意键<b>仅唤醒</b>；放弃确认 5 秒无操作自动取消；结算 3 秒后进入休息提示；
         统计页 10 秒自动退出。每完成第 4 个番茄，当次休息翻倍（闲时默认 60× 流速，25 分钟约 25 秒走完）。</p>
+      <p class="note" style="margin-top:8px">
+        <b>GO WORK!!</b>：每 2 秒被狠狠抽一鞭——240ms / 6 帧离散冲击（位移 +5/-6/+4/-3/+2/0），
+        前两帧叠加 CRT 三段行撕裂与 ±8px 红色残影、顶行瞬时提亮，随后快速归位，平时完全静止。<br>
+        <b>WiFi 配网</b>：无凭据开机自动弹横幅；手机连 WHIPLASH-XXXX → 打开 192.168.4.1 → 填 WiFi。
+        横幅期间按 OK 离线继续；闲时长按 DOWN 重新配网；AP 5 分钟无操作自动关闭。</p>
     </div>
   </aside>
 </div>
@@ -182,6 +213,10 @@ let deadline=0,breakDeadline=0,rewardDL=0,confirmDL=0;
 let blScene='IDLE',blRefReal=performance.now(),blCur=100,screenOff=false;
 let timeMode='SYNCED',blSim=true;
 let stats={days:[[3,45],[4,60],[0,0],[6,100],[2,25],[4,50],[3,75]],totalP:128,totalM:3160};
+/* WiFi 配网模拟（对应固件 wifi_provision + wifi_banner_refresh）：
+ * NONE=有凭据正常 | SETUP=配网横幅 | OK=保存后 SNTP 成功 | FAILED=连接失败 */
+let wifiProv='NONE',wifiDismissed=false;
+const AP_SSID='WHIPLASH-A3F2';
 
 const $=id=>document.getElementById(id);
 const cv=$('cv'),ctx=cv.getContext('2d');
@@ -364,36 +399,36 @@ const GW=[
  {w:2,r:['##','##','##','##','##','..','##']}];
 const GW_ITAL=[3,2,2,1,1,0,0];
 function gwTotal(){let t=GW_ITAL[0];GW.forEach(g=>t+=g.w+1);return t-1;}
-function gwPass(dx,dy,topC,bodyC){
+function gwPass(dx,dy,tear,topC,bodyC){
   const S=4;
   let gx=(240-gwTotal()*S)/2;
   for(let i=0;i<GW.length;i++){
     const g=GW[i],gdy=(i===4)?2:0;
     for(let r=0;r<7;r++){
       const rdx=(i===8&&r===2)?S:0,clip=(i===7&&r===0);
+      const rt=tear?tear[r<3?0:(r<5?1:2)]:0;   /* CRT 三段行撕裂 */
       for(let c=0;c<g.w;c++){
         if(g.r[r][c]!=='#')continue;
         if(clip&&c>0)continue;
-        rect(gx+c*S+rdx+GW_ITAL[r]*S+dx,252+r*S+dy+gdy,S,S,r===0?topC:bodyC);
+        rect(gx+c*S+rdx+GW_ITAL[r]*S+dx+rt,252+r*S+dy+gdy,S,S,r===0?topC:bodyC);
       }
     }
     gx+=(g.w+1)*S;
   }
 }
 function drawGowork(){
+  if(wifiBannerOn())return; /* 配网横幅期间咆哮暂停（与固件一致） */
   const ph=performance.now()%2000;
-  let dx=0,dy=0,glitch=0;
-  if(ph<160){ /* 每 2s 抽搐 160ms，4 帧离散步进 */
-    const f=Math.floor(ph/40);
-    dx=[2,-2,1,0][f];dy=[0,1,-1,0][f];
-    glitch=f===1?1:f===2?2:0;
-  }
+  let f=-1;
+  if(ph<240)f=Math.floor(ph/40); /* 每 2s 猛抽一鞭 240ms，6 帧离散步进无 easing */
+  const dx=f<0?0:[5,-6,4,-3,2,0][f],dy=f<0?0:[-2,2,-1,1,0,0][f];
+  const tear=f===0?[6,-6,3]:f===1?[-5,7,-3]:null;  /* 最强两帧行撕裂 */
   let sdx=dx+3,sdy=dy+3;
-  if(glitch===1)sdx-=3;else if(glitch===2)sdx+=3;
-  gwPass(sdx,sdy,'#5A120E','#5A120E');            /* 硬阴影 */
-  if(glitch===1)gwPass(dx+4,dy,'#9D1718','#9D1718');       /* red ghost */
-  else if(glitch===2)gwPass(dx-4,dy+1,'#9D1718','#9D1718');
-  gwPass(dx,dy,'#FF6B47',C_RED);                  /* 主字：顶行高光 */
+  if(f===0)sdx-=4;else if(f===1)sdx+=4;            /* 阴影与主字拉开更远 */
+  gwPass(sdx,sdy,tear,'#5A120E','#5A120E');        /* 硬阴影 */
+  if(f===0)gwPass(dx-8,dy,tear,'#9D1718','#9D1718');       /* red ghost ±8px */
+  else if(f===1)gwPass(dx+8,dy+1,tear,'#9D1718','#9D1718');
+  gwPass(dx,dy,tear,f===0?'#FFC4B4':'#FF6B47',C_RED); /* 帧0顶行瞬时提亮近白 */
 }
 /* 闲时屏像素文本：日期 / 电量 / 摘要 / 档位 */
 function drawIdleTexts(){
@@ -464,6 +499,9 @@ function displayedSeconds(){
   if(S.state==='BREAK_RUNNING'||S.state==='BREAK_PAUSED')return S.breakRem;
   return S.state==='IDLE'?FOCUS_MIN[S.idx]*60:S.remaining;
 }
+function wifiBannerOn(){
+  return !S.statsView&&S.state==='IDLE'&&wifiProv!=='NONE'&&!wifiDismissed;
+}
 function key(btn,ev){
   const now=performance.now();
   if(screenOff){blRefReal=now;return;}
@@ -471,6 +509,15 @@ function key(btn,ev){
   if(S.statsView){
     if(btn==='OK'&&ev==='CLICK'){S.statsView=false;}
     else S.statsOpenReal=now;
+    return;
+  }
+  /* 配网横幅：OK 关掉提示，番茄钟离线继续可用（AP 后台仍等 5 分钟） */
+  if(wifiBannerOn()&&btn==='OK'&&(ev==='CLICK'||ev==='DOUBLE')){
+    wifiDismissed=true;return;
+  }
+  if(ev==='LONG'){
+    /* 闲时长按 DOWN 重进配网（不删旧凭据）；长按 OK 真机由 main.c 拦截退出 */
+    if(S.state==='IDLE'&&btn==='DOWN'){wifiProv='SETUP';wifiDismissed=false;timeMode='NONE';}
     return;
   }
   if(ev==='DOUBLE'){
@@ -546,6 +593,28 @@ function updateUI(){
   const idle=S.state==='IDLE',reward=S.state==='REWARD',timing=!idle&&!reward;
   $('statsLayer').style.display=S.statsView?'':'none';
 
+  /* WiFi 配网/结果横幅（对应固件 wifi_banner_refresh） */
+  const wOn=wifiBannerOn();
+  $('wifiLayer').style.display=wOn?'':'none';
+  if(wOn){
+    const t=$('wfTitle'),l1=$('wfL1');
+    if(wifiProv==='SETUP'){
+      t.textContent='WIFI SETUP';t.style.color=C_RED;
+      l1.textContent='CONNECT:';l1.style.color=C_DIM;
+      $('wfL2').textContent=AP_SSID;$('wfL2').style.color=C_W;
+      $('wfL3').textContent='OPEN:';$('wfL3').style.color=C_DIM;
+      $('wfL4').textContent='192.168.4.1';$('wfL4').style.color=C_W;
+      $('wfL5').textContent='OK: OFFLINE';$('wfL5').style.color=C_DIM;
+    }else if(wifiProv==='OK'){
+      t.textContent='WIFI OK';t.style.color=C_W;
+      l1.textContent='TIME SYNCED';l1.style.color=C_W;
+    }else if(wifiProv==='FAILED'){
+      t.textContent='WIFI FAILED';t.style.color=C_RED;
+      l1.textContent='HOLD DOWN FOR SETUP';l1.style.color=C_W;
+    }
+    if(wifiProv!=='SETUP')['wfL2','wfL3','wfL4','wfL5'].forEach(id=>$(id).textContent='');
+  }
+
   /* 主层与统计层互斥 */
   const mainVisible=!S.statsView;
   ['lTop','lBatt','lMmss','lState','lPlus','lDone'].forEach(id=>{
@@ -604,12 +673,18 @@ function updateUI(){
   $('svRound').textContent=(S.round+1)+'/4';
   $('svBreak').textContent=S.pendingBreak?S.pendingBreak+' MIN':'—';
   $('svBl').textContent=screenOff?'息屏':blCur+'%';
+  $('svWifi').textContent=wifiProv==='NONE'?'在线':(wifiProv==='SETUP'?'配网':(wifiProv==='OK'?'已同步':'失败'));
 }
 
 /* ===== 控制台动作 ===== */
 function setSpeed(v){
   speed=v;
   document.querySelectorAll('[data-sp]').forEach(b=>b.classList.toggle('on',+b.dataset.sp===v));
+}
+function setWifi(m){
+  wifiProv=m;wifiDismissed=false;
+  if(m==='SETUP')timeMode='NONE';        /* 无凭据：时钟 --:-- */
+  else if(m==='OK')timeMode='SYNCED';    /* 保存并同步成功 */
 }
 function toggleBl(){
   blSim=!blSim;
@@ -623,6 +698,7 @@ function resetAll(){
   Object.assign(S,{state:'IDLE',idx:4,round:0,remaining:0,breakRem:0,pendingBreak:0,
     muted:false,statsView:false});
   stats={days:[[3,45],[4,60],[0,0],[6,100],[2,25],[4,50],[3,75]],totalP:128,totalM:3160};
+  wifiProv='NONE';wifiDismissed=false;timeMode='SYNCED';
   blScene='IDLE';blRefReal=performance.now();
 }
 

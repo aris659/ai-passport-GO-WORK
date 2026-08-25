@@ -17,6 +17,7 @@
 #include "pomodoro_stats.h"
 #include "pomodoro_store.h"
 #include "pomodoro_time.h"
+#include "wifi_provision.h"
 
 #define COLOR_BG       0x050608
 #define COLOR_WHITE    0xF4F1E8
@@ -61,7 +62,7 @@ static pomo_stats_t s_stats;
 static int64_t s_anchor_unix;
 static bool s_prepared;
 static bool s_audio_ok;
-static bool s_battery_ok;
+static bool s_battery_online;   /* CW2017 init 成功；失败可运行时恢复 */
 static QueueHandle_t s_audio_queue;
 static volatile bool s_audio_cancel;
 
@@ -75,6 +76,7 @@ static lv_obj_t *s_battery_label;
 static lv_obj_t *s_battery_icon;
 static lv_obj_t *s_brand;
 static lv_obj_t *s_clock_layer;
+static lv_obj_t *s_gowork_layer;
 static lv_obj_t *s_heart_layer;
 static lv_obj_t *s_mmss_label;
 static lv_obj_t *s_plus_label;
@@ -95,6 +97,8 @@ static bool s_stats_view;
 static uint64_t s_stats_open_ms;
 static int s_battery_soc = -1;
 static uint64_t s_last_battery_ms;
+static uint64_t s_batt_retry_ms;      /* 电量计 init 重试时刻 */
+static uint8_t s_batt_retry_count;    /* 1s/3s/10s 后转 60s 周期 */
 static uint32_t s_last_sec = UINT32_MAX;
 static uint32_t s_last_minute = UINT32_MAX;
 static uint32_t s_save_bucket = UINT32_MAX;
@@ -114,13 +118,26 @@ static char s_idle_date[16];
 
 /* GO WORK!! 街机警告体动画状态 */
 typedef struct {
-    int8_t dx, dy;     /* 抽搐偏移（屏幕像素） */
-    uint8_t glitch;    /* 0=无 1/2=glitch 帧 */
+    uint8_t frame;     /* 当前帧；GW_FRAME_REST = 静止 */
 } gw_anim_t;
 static gw_anim_t s_gw;
 static uint64_t s_gw_next_ms;   /* 下次咆哮开始时刻 */
 static uint64_t s_gw_end_ms;    /* 当前咆哮结束时刻 */
 static bool s_gw_active;
+
+/* WiFi 配网横幅（闲时覆盖层） */
+static lv_obj_t *s_wifi_layer;
+static lv_obj_t *s_wifi_title;
+static lv_obj_t *s_wifi_l1;
+static lv_obj_t *s_wifi_l2;
+static lv_obj_t *s_wifi_l3;
+static lv_obj_t *s_wifi_l4;
+static lv_obj_t *s_wifi_l5;
+static bool s_wifi_banner_on;
+static bool s_wifi_banner_dismissed;
+static pomo_prov_state_t s_prev_prov_state = POMO_PROV_IDLE;
+static uint8_t s_wifi_banner_sig = 0xFF;
+static uint64_t s_last_wifi_check_ms;
 
 /* 计时屏血心状态 */
 static float s_heart_frac;        /* 血量 0..1：专注=剩余，休息=已回补 */
@@ -364,9 +381,13 @@ static void pix_text_draw(lv_layer_t *layer, const lv_area_t *base,
 
 /* ---------- GO WORK!! 街机 Boss 警告体 ----------
  * 粗体 7 行像素字形（仅 GO WORK!! 所需 9 个 glyph），
- * 右倾斜切 + 硬阴影 + glitch 抽搐动画。 */
+ * 右倾斜切 + 硬阴影 + 猛烈抽搐动画。
+ * 独立小层（240x56）：咆哮时只重绘底部，不刷整个闲时屏。 */
 
-enum { GW_SCALE = 4, GW_Y = 252, GW_N = 9 };
+enum { GW_SCALE = 4, GW_N = 9 };
+#define GW_LAYER_Y  244           /* 层在主视图中的 y */
+#define GW_LAYER_H  56
+#define GW_Y        8             /* 层内局部 y（绝对 252，与旧版静止位一致） */
 
 static const char *GW_ROWS[GW_N][7] = {
     {".####.","##..##","##....","##.###","##..##","##..##",".####."}, /* G */
@@ -383,15 +404,28 @@ static const uint8_t GW_WIDTH[GW_N] = {6, 6, 4, 7, 6, 6, 6, 2, 2};
 /* 右倾：每行向右偏移（像素字形单位） */
 static const uint8_t GW_ITAL[7] = {3, 2, 2, 1, 1, 0, 0};
 
+/* 一鞭：240ms / 6 个离散帧，无 easing。前两帧最猛
+ * （大幅位移 + CRT 行撕裂 + ghost + 顶行提亮），随后快速衰减归位。
+ * 目标是"被狠狠抽了一鞭"，不是持续摇晃。 */
+enum { GW_FRAMES = 6, GW_FRAME_MS = 40, GW_FRAME_REST = 255 };
+#define GW_BURST_MS (GW_FRAMES * GW_FRAME_MS)
+static const int8_t GW_DX[GW_FRAMES] = { 5, -6,  4, -3, 2, 0 };
+static const int8_t GW_DY[GW_FRAMES] = {-2,  2, -1,  1, 0, 0 };
+/* CRT 行撕裂：最强两帧 顶(0-2)/中(3-4)/底(5-6) 三段水平错位（屏幕像素） */
+static const int8_t GW_TEAR_A[3] = {  6, -6,  3 };
+static const int8_t GW_TEAR_B[3] = { -5,  7, -3 };
+
 static int gowork_total_w(void) {
     int t = 0;
     for (int i = 0; i < GW_N; i++) t += GW_WIDTH[i] + 1;
     return (t - 1 + GW_ITAL[0]) * GW_SCALE;
 }
 
-/* 单层绘制：含静态损伤细节（基线偏移 / 顶部削角 / 行错位） */
+/* 单层绘制：含静态损伤细节（基线偏移 / 顶部削角 / 行错位）。
+ * tear 非空时顶/中/底三段附加水平错位。 */
 static void gowork_pass(lv_layer_t *layer, const lv_area_t *base,
-                        int dx, int dy, uint32_t top_col, uint32_t body_col) {
+                        int dx, int dy, const int8_t *tear,
+                        uint32_t top_col, uint32_t body_col) {
     int gx = (240 - gowork_total_w()) / 2 + dx;
     for (int i = 0; i < GW_N; i++) {
         const char *const *rows = GW_ROWS[i];
@@ -400,12 +434,14 @@ static void gowork_pass(lv_layer_t *layer, const lv_area_t *base,
         for (int r = 0; r < 7; r++) {
             int rdx = (i == 8 && r == 2) ? GW_SCALE : 0; /* 第二个 ! 错位 */
             bool clip = (i == 7 && r == 0);              /* 第一个 ! 削角 */
+            int row_tear = tear ? tear[r < 3 ? 0 : (r < 5 ? 1 : 2)] : 0;
             uint32_t col = (r == 0) ? top_col : body_col;
             for (int c = 0; c < w; c++) {
                 if (rows[r][c] != '#') continue;
                 if (clip && c > 0) continue;
                 draw_pixel_rect(layer, base,
-                                gx + c * GW_SCALE + rdx + GW_ITAL[r] * GW_SCALE,
+                                gx + c * GW_SCALE + rdx + GW_ITAL[r] * GW_SCALE
+                                    + row_tear,
                                 GW_Y + r * GW_SCALE + dy + gdy,
                                 GW_SCALE, GW_SCALE, col, 0);
             }
@@ -415,37 +451,50 @@ static void gowork_pass(lv_layer_t *layer, const lv_area_t *base,
 }
 
 static void gowork_draw(lv_layer_t *layer, const lv_area_t *base) {
-    /* 硬阴影：glitch 帧与主字横向拉开 */
-    int sdx = s_gw.dx + 3, sdy = s_gw.dy + 3;
-    if (s_gw.glitch == 1) sdx -= 3;
-    else if (s_gw.glitch == 2) sdx += 3;
-    gowork_pass(layer, base, sdx, sdy, COLOR_RED_DEAD, COLOR_RED_DEAD);
+    int f = s_gw.frame;
+    int dx = (f < GW_FRAMES) ? GW_DX[f] : 0;
+    int dy = (f < GW_FRAMES) ? GW_DY[f] : 0;
+    const int8_t *tear = (f == 0) ? GW_TEAR_A : (f == 1) ? GW_TEAR_B : NULL;
 
-    /* red ghost：仅 glitch 帧，瞬间即逝 */
-    if (s_gw.glitch == 1) {
-        gowork_pass(layer, base, s_gw.dx + 4, s_gw.dy,
+    /* 硬阴影：glitch 帧与主字横向拉开更远 */
+    int sdx = dx + 3, sdy = dy + 3;
+    if (f == 0) sdx -= 4;
+    else if (f == 1) sdx += 4;
+    gowork_pass(layer, base, sdx, sdy, tear, COLOR_RED_DEAD, COLOR_RED_DEAD);
+
+    /* red ghost：仅最强两帧，±8px 撕出的残影 */
+    if (f == 0) {
+        gowork_pass(layer, base, dx - 8, dy, tear,
                     COLOR_RED_DARK, COLOR_RED_DARK);
-    } else if (s_gw.glitch == 2) {
-        gowork_pass(layer, base, s_gw.dx - 4, s_gw.dy + 1,
+    } else if (f == 1) {
+        gowork_pass(layer, base, dx + 8, dy + 1, tear,
                     COLOR_RED_DARK, COLOR_RED_DARK);
     }
 
-    /* 主字：顶行橙红高光 + 正红字身 */
-    gowork_pass(layer, base, s_gw.dx, s_gw.dy, 0xFF6B47, COLOR_RED);
+    /* 主字：顶行橙红高光；最强冲击帧顶行瞬时提亮近白（仅一帧） */
+    uint32_t top = (f == 0) ? 0xFFC4B4 : 0xFF6B47;
+    gowork_pass(layer, base, dx, dy, tear, top, COLOR_RED);
 }
 
-/* 动画调度：平时完全静止；每 2s 发作 160ms，
- * 4 个离散帧（无 easing），咆哮窗口内 timer 临时切 40ms 帧率。 */
+static void gowork_draw_cb(lv_event_t *event) {
+    lv_obj_t *obj = lv_event_get_current_target(event);
+    lv_layer_t *layer = lv_event_get_layer(event);
+    lv_area_t base;
+    lv_obj_get_coords(obj, &base);
+    gowork_draw(layer, &base);
+}
+
+/* 动画调度：平时完全静止；每 2s 猛抽一鞭 240ms / 6 个离散帧（无 easing），
+ * 咆哮窗口内 timer 临时切 40ms 帧率。只失效 GO WORK 小层。 */
 static void gowork_anim_update(uint64_t now_ms) {
     if (!s_timer) return;
 
-    bool scene_ok = !s_stats_view && s_clock_layer &&
-                    s_model.state == POMODORO_IDLE;
+    bool scene_ok = !s_stats_view && s_gowork_layer &&
+                    s_model.state == POMODORO_IDLE && !s_wifi_banner_on;
     if (s_gw_active && !scene_ok) {
         /* 场景切走：立即终止抽搐并恢复正常帧率 */
         s_gw_active = false;
-        s_gw.dx = s_gw.dy = 0;
-        s_gw.glitch = 0;
+        s_gw.frame = GW_FRAME_REST;
         lv_timer_set_period(s_timer, 200);
         return;
     }
@@ -453,27 +502,23 @@ static void gowork_anim_update(uint64_t now_ms) {
 
     if (now_ms >= s_gw_next_ms) {
         s_gw_next_ms = now_ms + 2000;
-        s_gw_end_ms = now_ms + 160;
+        s_gw_end_ms = now_ms + GW_BURST_MS;
         s_gw_active = true;
-        lv_timer_set_period(s_timer, 40);
+        lv_timer_set_period(s_timer, GW_FRAME_MS);
     }
 
     if (s_gw_active) {
         if (now_ms >= s_gw_end_ms) {
             s_gw_active = false;
-            s_gw.dx = s_gw.dy = 0;
-            s_gw.glitch = 0;
+            s_gw.frame = GW_FRAME_REST;
             lv_timer_set_period(s_timer, 200);
         } else {
-            static const int8_t DX[4] = {2, -2, 1, 0};
-            static const int8_t DY[4] = {0, 1, -1, 0};
-            uint32_t f = (uint32_t)((now_ms - (s_gw_end_ms - 160)) / 40);
-            if (f > 3) f = 3;
-            s_gw.dx = DX[f];
-            s_gw.dy = DY[f];
-            s_gw.glitch = (f == 1) ? 1 : (f == 2) ? 2 : 0;
+            uint32_t f = (uint32_t)(now_ms - (s_gw_end_ms - GW_BURST_MS)) /
+                         GW_FRAME_MS;
+            if (f >= GW_FRAMES) f = GW_FRAMES - 1;
+            s_gw.frame = (uint8_t)f;
         }
-        lv_obj_invalidate(s_clock_layer);
+        lv_obj_invalidate(s_gowork_layer);
     }
 }
 
@@ -574,9 +619,7 @@ static void idle_clock_draw_cb(lv_event_t *event) {
         pix_text_draw(layer, &base, (240 - pix_text_width(buf, 3)) / 2,
                       204, 3, buf, COLOR_RED);
     }
-
-    /* GO WORK!! 街机 Boss 警告体 */
-    gowork_draw(layer, &base);
+    /* GO WORK!! 由独立小层 s_gowork_layer 绘制（局部刷新） */
 }
 
 /* ---------- 以撒风血心 ---------- */
@@ -743,10 +786,21 @@ void demo_pomodoro_prepare(bool audio_ok, bool battery_ok) {
     if (s_prepared) return;
     s_prepared = true;
     s_audio_ok = audio_ok;
-    s_battery_ok = battery_ok;
     pomodoro_model_defaults(&s_model);
     pomodoro_store_init(&s_model, &s_stats, &s_anchor_unix);
     pomodoro_time_init(s_anchor_unix);
+
+    /* 电量计 boot 瞬间可能未就绪：一次 init 失败不判死刑，
+     * 按 1s/3s/10s 后转 60s 周期在 timer 里重试（见 battery_schedule_retry）。 */
+    s_battery_online = battery_ok;
+    if (s_battery_online) {
+        s_battery_soc = bsp_battery_soc();
+        ESP_LOGI(TAG, "Battery gauge online, initial SOC=%d", s_battery_soc);
+    } else {
+        s_batt_retry_count = 0;
+        s_batt_retry_ms = now_ms() + 1000;
+        ESP_LOGW(TAG, "Battery init failed; retry at 1s/3s/10s then 60s");
+    }
 
     if (s_audio_ok) {
         s_audio_queue = xQueueCreate(1, sizeof(uint8_t));
@@ -913,8 +967,78 @@ static void refresh_stats_view(void) {
     if (s_chart_layer) lv_obj_invalidate(s_chart_layer);
 }
 
+/* ---------- WiFi 配网横幅 ---------- */
+
+/* 闲时覆盖层：配网会话期间显示 AP 信息；保存后 15 分钟内显示连接结果。
+ * OK 可随时关掉横幅离线继续用番茄钟；AP 5 分钟无操作自动关闭。 */
+static void wifi_banner_refresh(void) {
+    if (!s_wifi_layer) return;
+
+    /* 配网状态机变化（新会话/保存完成/超时）时清掉旧的 dismiss */
+    pomo_prov_state_t ps = pomo_wifi_prov_state();
+    if (ps != s_prev_prov_state) {
+        s_prev_prov_state = ps;
+        s_wifi_banner_dismissed = false;
+    }
+
+    bool on = !s_stats_view && s_model.state == POMODORO_IDLE &&
+              pomo_wifi_prov_show_banner() && !s_wifi_banner_dismissed;
+    s_wifi_banner_on = on;
+    set_hidden(s_wifi_layer, !on);
+    if (!on) return;
+
+    if (ps == POMO_PROV_ACTIVE) {
+        lv_label_set_text(s_wifi_title, "WIFI SETUP");
+        lv_obj_set_style_text_color(s_wifi_title, lv_color_hex(COLOR_RED), 0);
+        lv_label_set_text(s_wifi_l1, "CONNECT:");
+        lv_obj_set_style_text_color(s_wifi_l1, lv_color_hex(COLOR_DIM), 0);
+        lv_label_set_text(s_wifi_l2, pomo_wifi_prov_ap_ssid());
+        lv_obj_set_style_text_color(s_wifi_l2, lv_color_hex(COLOR_WHITE), 0);
+        lv_label_set_text(s_wifi_l3, "OPEN:");
+        lv_obj_set_style_text_color(s_wifi_l3, lv_color_hex(COLOR_DIM), 0);
+        lv_label_set_text(s_wifi_l4, "192.168.4.1");
+        lv_obj_set_style_text_color(s_wifi_l4, lv_color_hex(COLOR_WHITE), 0);
+        lv_label_set_text(s_wifi_l5, "OK: OFFLINE");
+        lv_obj_set_style_text_color(s_wifi_l5, lv_color_hex(COLOR_DIM), 0);
+        return;
+    }
+
+    /* 保存后的结果横幅：呈现连接进展 */
+    switch (pomodoro_time_wifi_state()) {
+        case POMO_WIFI_STATE_CONNECTED:
+            lv_label_set_text(s_wifi_title, "WIFI OK");
+            lv_obj_set_style_text_color(s_wifi_title,
+                                        lv_color_hex(COLOR_WHITE), 0);
+            lv_label_set_text(s_wifi_l1, "TIME SYNCED");
+            lv_obj_set_style_text_color(s_wifi_l1,
+                                        lv_color_hex(COLOR_WHITE), 0);
+            break;
+        case POMO_WIFI_STATE_FAILED:
+            lv_label_set_text(s_wifi_title, "WIFI FAILED");
+            lv_obj_set_style_text_color(s_wifi_title,
+                                        lv_color_hex(COLOR_RED), 0);
+            lv_label_set_text(s_wifi_l1, "HOLD DOWN FOR SETUP");
+            lv_obj_set_style_text_color(s_wifi_l1,
+                                        lv_color_hex(COLOR_WHITE), 0);
+            break;
+        default:
+            lv_label_set_text(s_wifi_title, "WIFI");
+            lv_obj_set_style_text_color(s_wifi_title,
+                                        lv_color_hex(COLOR_WHITE), 0);
+            lv_label_set_text(s_wifi_l1, "CONNECTING...");
+            lv_obj_set_style_text_color(s_wifi_l1,
+                                        lv_color_hex(COLOR_DIM), 0);
+            break;
+    }
+    lv_label_set_text(s_wifi_l2, "");
+    lv_label_set_text(s_wifi_l3, "");
+    lv_label_set_text(s_wifi_l4, "");
+    lv_label_set_text(s_wifi_l5, "");
+}
+
 static void refresh_ui(void) {
     if (!s_scr) return;
+    wifi_banner_refresh();
     if (s_stats_view) {
         refresh_stats_view();
         return;
@@ -940,6 +1064,7 @@ static void refresh_ui(void) {
 
     set_hidden(s_brand, !idle);
     set_hidden(s_clock_layer, !idle);
+    set_hidden(s_gowork_layer, !idle);
     set_hidden(s_top_label, idle);      /* 闲时日期/电量由像素层绘制 */
     set_hidden(s_battery_label, idle);
     if (idle) {
@@ -1010,6 +1135,15 @@ static void set_stats_view(bool enabled) {
 }
 
 /* ---------- 定时器 ---------- */
+
+/* 电量计 init 重试节奏：1s / 3s / 10s 之后每 60s 一次 */
+static void battery_schedule_retry(uint64_t now) {
+    static const uint32_t EARLY_MS[3] = { 1000, 3000, 10000 };
+    uint32_t delay = s_batt_retry_count < 3 ? EARLY_MS[s_batt_retry_count]
+                                            : 60ULL * 1000;
+    s_batt_retry_count++;
+    s_batt_retry_ms = now + delay;
+}
 
 static void timer_cb(lv_timer_t *timer) {
     (void)timer;
@@ -1102,12 +1236,46 @@ static void timer_cb(lv_timer_t *timer) {
         set_stats_view(false);
     }
 
-    /* 电池轮询基于真实时间而非 tick 计数：
-     * GO WORK 动画会把 timer 周期临时切到 40ms，tick 计数会失真。 */
-    if (time_ms - s_last_battery_ms >= 30ULL * 1000) {
+    /* WiFi 配网横幅轮询：prov/wifi 状态变化时刷新内容（1s 粒度） */
+    if (time_ms - s_last_wifi_check_ms >= 1000) {
+        s_last_wifi_check_ms = time_ms;
+        uint8_t sig = (uint8_t)(((pomo_wifi_prov_state() & 3) << 4) |
+                                ((pomodoro_time_wifi_state() & 3) << 2) |
+                                (s_wifi_banner_dismissed ? 2 : 0) |
+                                (pomo_wifi_prov_show_banner() ? 1 : 0));
+        if (sig != s_wifi_banner_sig) {
+            s_wifi_banner_sig = sig;
+            refresh_ui();
+        }
+    }
+
+    /* 电池：boot init 失败可运行时恢复（1s/3s/10s 后 60s 周期重试 init）；
+     * online 后每 30s 读 SOC，读失败保留 --% 稍后重试，不清 UI。
+     * 轮询基于真实时间而非 tick 计数（GO WORK 动画会临时切 40ms 帧率）。 */
+    if (!s_battery_online) {
+        if (time_ms >= s_batt_retry_ms) {
+            battery_schedule_retry(time_ms);
+            if (bsp_battery_init() == ESP_OK) {
+                s_battery_online = true;
+                s_battery_soc = bsp_battery_soc();
+                ESP_LOGI(TAG, "Battery gauge online, SOC=%d", s_battery_soc);
+                refresh_ui();
+            }
+        }
+    } else if (time_ms - s_last_battery_ms >= 30ULL * 1000) {
         s_last_battery_ms = time_ms;
-        if (s_battery_ok) s_battery_soc = bsp_battery_soc();
-        refresh_ui();
+        int soc = bsp_battery_soc();
+        if (soc < 0) {
+            ESP_LOGW(TAG, "Battery SOC read failed");
+            if (s_battery_soc != -1) {
+                s_battery_soc = -1;
+                refresh_ui();
+            }
+        } else if (soc != s_battery_soc) {
+            s_battery_soc = soc;
+            ESP_LOGI(TAG, "Battery SOC=%d", soc);
+            refresh_ui();
+        }
     }
 }
 
@@ -1122,15 +1290,16 @@ void demo_pomodoro_enter(void) {
     s_last_time_status = pomodoro_time_status();
     s_last_hourly_ms = now_ms();
     s_last_battery_ms = now_ms();
+    s_last_wifi_check_ms = now_ms();
+    s_wifi_banner_sig = 0xFF;
     s_bl_scene = bl_scene_from_state();
     s_bl_ref_ms = now_ms();
     s_bl_current = 100;
     s_screen_off = false;
-    s_gw.dx = s_gw.dy = 0;
-    s_gw.glitch = 0;
+    s_gw.frame = GW_FRAME_REST;
     s_gw_active = false;
     s_gw_next_ms = now_ms() + 2000;
-    if (s_battery_ok) s_battery_soc = bsp_battery_soc();
+    if (s_battery_online) s_battery_soc = bsp_battery_soc();
 
     s_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s_scr, lv_color_hex(COLOR_BG), 0);
@@ -1150,9 +1319,13 @@ void demo_pomodoro_enter(void) {
                                        battery_draw_cb);
     s_brand = brand_create(s_main_layer);
 
-    /* 闲时屏全像素层：日期/电量/时钟/血心行/摘要/档位/GO WORK!! */
+    /* 闲时屏全像素层：日期/电量/时钟/血心行/摘要/档位 */
     s_clock_layer = draw_layer_create(s_main_layer, 0, 0, 240, 320,
                                       idle_clock_draw_cb);
+
+    /* GO WORK!! 独立小层：咆哮时只重绘底部 56px，静止位与旧版一致 */
+    s_gowork_layer = draw_layer_create(s_main_layer, 0, GW_LAYER_Y,
+                                       240, GW_LAYER_H, gowork_draw_cb);
 
     /* 计时屏：血心排空 + 下方大号倒计时 */
     s_heart_layer = draw_layer_create(s_main_layer, 0, 40, 240, 150,
@@ -1160,7 +1333,10 @@ void demo_pomodoro_enter(void) {
     s_mmss_label = centered_label(s_main_layer, &lv_font_montserrat_48,
                                   COLOR_WHITE, 184);
     s_state_label = label(s_main_layer, &lv_font_montserrat_14, COLOR_RED);
-    lv_obj_set_width(s_state_label, 70);
+    /* 70px 会让 ABANDON? 折行；加宽 + CLIP 保证 PAUSE/RESUME/REST/ABANDON?
+     * 统一字号、永远单行（x=42 + 150 = 192 < 240 右边界） */
+    lv_obj_set_width(s_state_label, 150);
+    lv_label_set_long_mode(s_state_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(s_state_label, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_pos(s_state_label, 42, 286);
     s_action_icon = draw_layer_create(s_main_layer, 27, 287, 11, 16,
@@ -1173,6 +1349,24 @@ void demo_pomodoro_enter(void) {
     s_done_label = centered_label(s_main_layer, &lv_font_montserrat_14,
                                   COLOR_DIM, 196);
     lv_label_set_text(s_done_label, "WHIP LANDED");
+
+    /* WiFi 配网/结果横幅：闲时覆盖层（黑底白字红标题，与整机视觉一致） */
+    s_wifi_layer = container(s_main_layer, 0, 0, 240, 320);
+    lv_obj_set_style_bg_color(s_wifi_layer, lv_color_hex(COLOR_BG), 0);
+    lv_obj_set_style_bg_opa(s_wifi_layer, LV_OPA_COVER, 0);
+    s_wifi_title = centered_label(s_wifi_layer, &lv_font_montserrat_20,
+                                  COLOR_RED, 60);
+    s_wifi_l1 = centered_label(s_wifi_layer, &lv_font_montserrat_14,
+                               COLOR_DIM, 112);
+    s_wifi_l2 = centered_label(s_wifi_layer, &lv_font_montserrat_14,
+                               COLOR_WHITE, 134);
+    s_wifi_l3 = centered_label(s_wifi_layer, &lv_font_montserrat_14,
+                               COLOR_DIM, 158);
+    s_wifi_l4 = centered_label(s_wifi_layer, &lv_font_montserrat_14,
+                               COLOR_WHITE, 180);
+    s_wifi_l5 = centered_label(s_wifi_layer, &lv_font_montserrat_14,
+                               COLOR_DIM, 226);
+    set_hidden(s_wifi_layer, true);
 
     /* 统计页 */
     s_stats_layer = container(s_scr, 0, 0, 240, 320);
@@ -1219,9 +1413,14 @@ void demo_pomodoro_exit(void) {
     s_scr = s_main_layer = s_stats_layer = NULL;
     s_top_label = s_battery_label = s_battery_icon = s_brand = NULL;
     s_clock_layer = NULL;
+    s_gowork_layer = NULL;
     s_heart_layer = NULL;
     s_mmss_label = s_state_label = s_action_icon = NULL;
     s_plus_label = s_done_label = NULL;
+    s_wifi_layer = s_wifi_title = NULL;
+    s_wifi_l1 = s_wifi_l2 = s_wifi_l3 = NULL;
+    s_wifi_l4 = s_wifi_l5 = NULL;
+    s_wifi_banner_on = false;
     s_stats_today = s_chart_layer = s_stats_week = s_stats_all = NULL;
     for (int i = 0; i < 7; i++) s_stats_weekday[i] = NULL;
     s_stats_view = false;
@@ -1249,6 +1448,25 @@ void demo_pomodoro_key(bsp_btn_t btn, bsp_btn_ev_t ev) {
         } else {
             s_stats_open_ms = time_ms;
         }
+        return;
+    }
+
+    /* 配网横幅：OK 关掉提示，番茄钟离线继续可用（AP 后台仍等 5 分钟） */
+    if (s_wifi_banner_on && btn == BSP_BTN_OK &&
+        (ev == BSP_BTN_CLICK || ev == BSP_BTN_DOUBLE)) {
+        s_wifi_banner_dismissed = true;
+        refresh_ui();
+        return;
+    }
+
+    /* IDLE + 长按 DOWN：手动重新进入 WiFi 配网。
+     * 不删旧凭据；只有网页提交新的有效 SSID 才覆盖 NVS。
+     * （不用组合键：三键共用 ADC 分压不可靠；不用长按 OK：已被全局返回菜单占用） */
+    if (ev == BSP_BTN_LONG && btn == BSP_BTN_DOWN &&
+        s_model.state == POMODORO_IDLE) {
+        pomo_wifi_prov_start();
+        s_wifi_banner_dismissed = false;
+        refresh_ui();
         return;
     }
 

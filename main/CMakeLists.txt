@@ -19,6 +19,8 @@ idf_component_register(
          "pomodoro_stats.c"
          "pomodoro_blob.c"
          "pomodoro_time.c"
+         "wifi_prov_util.c"
+         "wifi_provision.c"
     INCLUDE_DIRS "."
-    REQUIRES bsp nvs_flash esp_timer esp_wifi esp_netif esp_event lwip
+    REQUIRES bsp nvs_flash esp_timer esp_wifi esp_netif esp_event lwip esp_http_server
 )
