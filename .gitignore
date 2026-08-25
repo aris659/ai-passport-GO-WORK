@@ -10,3 +10,6 @@ main/wifi_config.h
 
 # 带真实凭据的自编译固件勿提交（默认发布物 whiplash-*.bin 为空凭据版，可提交）
 releases/*my-wifi*
+
+# 原始实机素材（4K 视频 / HEIC 原图 / 多余候选照片），仅本地保留
+media_source/

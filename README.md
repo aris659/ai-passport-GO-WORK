@@ -1,10 +1,32 @@
 # WHIPLASH · GO WORK!!
 
+<p align="center">
+  <img src="assets/media/hero.jpg"
+       alt="WHIPLASH pomodoro firmware running on a FoloToy AI Passport (real hardware)"
+       width="600">
+</p>
+
 > 黑心老板番茄钟：完成一个番茄 = 吃一鞭。它每两秒在屏幕底部冲你咆哮一句 **GO WORK!!**。
+
+<p align="center">
+  <img src="assets/media/go-work.gif"
+       alt="GO WORK!! impact shake animation recorded on real hardware"
+       width="440">
+</p>
+
+<p align="center"><sub>真机实拍 · 每 2 秒一鞭：240ms 猛烈抽搐（大幅位移 + CRT 行撕裂 + 红色残影），平时完全静止</sub></p>
 
 基于 [FoloToy AI Passport](https://github.com/folotoy/ai-passport)（ESP32-C3 口袋设备）官方 BSP 演示改造的纯番茄钟固件：去掉了原版宠物养成系统，重写为一台插电即用的桌面专注工具，视觉走复古街机 Boss 警告风（像素血心 + CRT glitch 抽搐字幕）。
 
-烧录前可先在浏览器打开 [`docs/UI_PREVIEW.html`](docs/UI_PREVIEW.html) 交互式近似预览主要界面、布局、颜色与动画效果。
+## 实机效果
+
+以下均为真实设备实拍（FoloToy AI Passport · WHIPLASH v1.3.0），不是模拟器录屏：
+
+| 专注中 — 血心随倒计时放血排空 | 完成结算 — 一鞭落地 |
+| --- | --- |
+| <img src="assets/media/focus.jpg" alt="Focus screen: draining blood heart and countdown on real hardware" width="320"> | <img src="assets/media/reward.jpg" alt="Whip landed reward screen on real hardware" width="320"> |
+
+> 想在烧录前先看看界面？[`docs/UI_PREVIEW.html`](docs/UI_PREVIEW.html) 是浏览器里的交互式近似预览（模拟界面，非实机画面）；本页所有照片与 GIF 均为真机实拍。
 
 ## 功能
 
