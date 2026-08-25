@@ -1,5 +1,7 @@
 # WHIPLASH · GO WORK!!
 
+**中文** | [English](README_EN.md)
+
 <p align="center">
   <img src="assets/media/hero.jpg"
        alt="WHIPLASH pomodoro firmware running on a FoloToy AI Passport (real hardware)"
