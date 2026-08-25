@@ -4,7 +4,7 @@
 
 基于 [FoloToy AI Passport](https://github.com/folotoy/ai-passport)（ESP32-C3 口袋设备）官方 BSP 演示改造的纯番茄钟固件：去掉了原版宠物养成系统，重写为一台插电即用的桌面专注工具，视觉走复古街机 Boss 警告风（像素血心 + CRT glitch 抽搐字幕）。
 
-烧录前可先在浏览器打开 [`docs/UI_PREVIEW.html`](docs/UI_PREVIEW.html) 交互式预览全部界面——布局、颜色、动画与固件 1:1。
+烧录前可先在浏览器打开 [`docs/UI_PREVIEW.html`](docs/UI_PREVIEW.html) 交互式近似预览主要界面、布局、颜色与动画效果。
 
 ## 功能
 
@@ -145,7 +145,7 @@ tools/              Docker 构建脚本
 
 ## 测试
 
-纯逻辑测试在主机直接跑（模型 / 日期 / 统计 / 存储 blob / 像素数学 / WiFi 配网逻辑共 6 套）：
+纯逻辑测试在主机直接跑（模型 / 日期 / 统计 / 存储 blob / 像素数学 / 电池 SOC 就绪判定 / WiFi 配网逻辑共 7 套）：
 
 ```bash
 bash tests/run_all_tests.sh

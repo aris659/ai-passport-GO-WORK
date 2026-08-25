@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This repository is an ESP-IDF BSP and hardware demonstration for the ESP32-C3-based FoloToy AI Passport.
+This repository is the WHIPLASH application firmware built on the FoloToy AI Passport BSP (ESP32-C3), with retained BSP diagnostic demos.
 
 - `components/bsp/include/`: public BSP APIs and the hardware pin/configuration source of truth (`bsp_pins.h`).
 - `components/bsp/src/`: display, button, audio, battery, and shared-I2C implementations.
@@ -24,7 +24,7 @@ idf.py flash monitor          # Flash the connected board and open logs
 idf.py fullclean              # Remove generated build state when configuration is stale
 ```
 
-There is no host-side automated test suite currently. Treat a clean `idf.py build` as the minimum check, then run every applicable item in the README acceptance checklist on real hardware.
+Host-side pure-logic tests live in `tests/` and run without ESP-IDF via `bash tests/run_all_tests.sh` (7 suites: pomodoro model, date, stats, storage blob, pixel math, battery SOC gauge, WiFi provisioning). Treat a clean `idf.py build` plus `ALL_TEST_PASS` as the minimum check, then run every applicable item in the README acceptance checklist on real hardware.
 
 ## Coding Style & Naming Conventions
 
