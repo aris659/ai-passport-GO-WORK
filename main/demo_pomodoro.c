@@ -6,6 +6,7 @@
 #include "bsp_audio.h"
 #include "bsp_battery.h"
 #include "bsp_display.h"
+#include "battery_gauge.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -57,12 +58,31 @@ static const char *WEEKDAY_NAMES[] = {
     "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"
 };
 
+/* 电池状态机：bsp_battery_init()==ESP_OK 只代表 CW2017 在线应答。
+ * SOC raw 在 0..100 范围内不等于可信——raw=0x0000 是芯片上电默认值，
+ * 与 VCELL>=3.6V 明显矛盾（见 battery_gauge.c）。
+ * 就绪判定 = 连续 3 个可信样本，判定逻辑在 main/battery_gauge.c（host 可测）。 */
+typedef enum {
+    BATT_UNAVAILABLE = 0, /* 0x63 无应答：按 1s/3s/10s/60s 重试 init */
+    BATT_WAIT_READY,      /* 快速观察：250ms 轮询，10s 窗口；连续 3 可信 → READY */
+    BATT_READY,           /* SOC 可信：30s 轮询；连续 3 异常 → FALLBACK */
+    BATT_FALLBACK,        /* 显示实测电压；5s 低频读 SOC；仅在 CONFIG 异常等
+                             有证据时 restart（≤2 次/boot，60s cooldown） */
+} batt_state_t;
+
+#define BATT_FAST_POLL_MS        250         /* WAIT_READY 轮询间隔 */
+#define BATT_READY_WINDOW_MS     (10ULL*1000)/* WAIT_READY 观察窗口 */
+#define BATT_READY_POLL_MS       (30ULL*1000)/* READY 轮询间隔 */
+#define BATT_FALLBACK_POLL_MS    (5ULL*1000) /* FALLBACK 低频读 SOC 间隔 */
+#define BATT_RESTART_COOLDOWN_MS (60ULL*1000)
+#define BATT_MAX_RESTARTS        2           /* 一次 boot 最多自动 restart 次数 */
+
 static pomodoro_model_t s_model;
 static pomo_stats_t s_stats;
 static int64_t s_anchor_unix;
 static bool s_prepared;
 static bool s_audio_ok;
-static bool s_battery_online;   /* CW2017 init 成功；失败可运行时恢复 */
+static batt_state_t s_battery_state = BATT_UNAVAILABLE;
 static QueueHandle_t s_audio_queue;
 static volatile bool s_audio_cancel;
 
@@ -95,10 +115,19 @@ static uint16_t s_chart_min[7];
 static lv_timer_t *s_timer;
 static bool s_stats_view;
 static uint64_t s_stats_open_ms;
-static int s_battery_soc = -1;
-static uint64_t s_last_battery_ms;
-static uint64_t s_batt_retry_ms;      /* 电量计 init 重试时刻 */
-static uint8_t s_batt_retry_count;    /* 1s/3s/10s 后转 60s 周期 */
+static bg_ctx_t s_bg;                  /* SOC readiness 纯逻辑状态机 */
+static int s_battery_soc = -1;         /* bg_display_soc() 镜像，供文案/图标读 */
+static int s_battery_mv = -1;          /* EMA 平滑电压（fallback 文案/图标粗估用） */
+static uint8_t s_batt_mv_fail_streak;  /* 连续电压读失败：清空冻结的电压显示 */
+static int s_batt_volt_shown = -1;     /* 上次刷进 UI 的电压值（节流） */
+static uint64_t s_batt_volt_ui_ms;     /* 上次电压 UI 刷新时刻 */
+static uint64_t s_batt_next_poll_ms;   /* 下次轮询时刻（按状态取不同间隔） */
+static uint64_t s_batt_deadline_ms;    /* WAIT_READY 观察窗口截止 */
+static uint64_t s_batt_recovery_ms;    /* 上次有证据的 gauge restart；0=从未 */
+static uint8_t s_batt_restart_count;   /* 一次 boot 已 restart 次数 */
+static bool s_batt_logged_first;       /* WAIT_READY 首样本详情只打一次 */
+static uint64_t s_batt_retry_ms;       /* UNAVAILABLE 时 init 重试时刻 */
+static uint8_t s_batt_retry_count;     /* 1s/3s/10s 后转 60s 周期 */
 static uint32_t s_last_sec = UINT32_MAX;
 static uint32_t s_last_minute = UINT32_MAX;
 static uint32_t s_save_bucket = UINT32_MAX;
@@ -154,6 +183,20 @@ static bool s_screen_off;
 
 static uint64_t now_ms(void) {
     return (uint64_t)esp_timer_get_time() / 1000ULL;
+}
+
+/* 电量文案：READY → "NN%"；FALLBACK 且平滑电压落在 LiPo 合理区间 → 实测电压；
+ * 其余（不可用/等待就绪）→ "--%"。不把电压换算成看似精确的百分比。 */
+static void battery_text(char *buf, size_t len) {
+    if (s_battery_soc >= 0) {
+        snprintf(buf, len, "%d%%", s_battery_soc);
+    } else if (s_battery_state == BATT_FALLBACK &&
+               s_battery_mv >= 2500 && s_battery_mv <= 4500) {
+        snprintf(buf, len, "%d.%02dV", s_battery_mv / 1000,
+                 (s_battery_mv % 1000) / 10);
+    } else {
+        snprintf(buf, len, "--%%");
+    }
 }
 
 static lv_obj_t *container(lv_obj_t *parent, int x, int y, int w, int h) {
@@ -344,6 +387,7 @@ static const uint8_t PIX_LETTERS[26][7] = {
 static const uint8_t PIX_BLANK[7] = {0};
 static const uint8_t PIX_EXCL[7] = {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04};
 static const uint8_t PIX_PCT[7] = {0x19, 0x1A, 0x02, 0x04, 0x08, 0x0B, 0x13};
+static const uint8_t PIX_DOT[7] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06};
 
 static const uint8_t *pix_glyph(char ch) {
     if (ch >= 'A' && ch <= 'Z') return PIX_LETTERS[ch - 'A'];
@@ -353,6 +397,7 @@ static const uint8_t *pix_glyph(char ch) {
         case '-': return CLOCK_GLYPHS[10];
         case '!': return PIX_EXCL;
         case '%': return PIX_PCT;
+        case '.': return PIX_DOT;   /* 电压 fallback "3.82V" 需要 */
         default: return PIX_BLANK;
     }
 }
@@ -544,12 +589,10 @@ static void idle_clock_draw_cb(lv_event_t *event) {
         pix_text_draw(layer, &base, 9, 5, 2, s_idle_date, COLOR_DIM);
     }
     {
-        char buf[20];
-        if (s_battery_soc >= 0) {
-            snprintf(buf, sizeof(buf), "%d%%%s", s_battery_soc,
-                     s_model.muted ? " M" : "");
-        } else {
-            snprintf(buf, sizeof(buf), "--%%%s", s_model.muted ? " M" : "");
+        char buf[24];
+        battery_text(buf, sizeof(buf));
+        if (s_model.muted) {
+            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), " M");
         }
         int w = pix_text_width(buf, 2);
         pix_text_draw(layer, &base, 213 - w, 5, 2, buf, COLOR_DIM);
@@ -701,8 +744,20 @@ static void battery_draw_cb(lv_event_t *event) {
     draw_pixel_rect(layer, &base, 0, 0, 17, 10, COLOR_DIM, 2);
     draw_pixel_rect(layer, &base, 17, 3, 3, 4, COLOR_DIM, 0);
     draw_pixel_rect(layer, &base, 2, 2, 13, 6, COLOR_BG, 0);
-    int fill = s_battery_soc < 0 ? 0 : (s_battery_soc * 11 + 99) / 100;
-    if (fill > 0) draw_pixel_rect(layer, &base, 3, 3, fill, 4, COLOR_GREEN, 0);
+    int fill = 0;
+    uint32_t color = COLOR_GREEN;
+    if (s_battery_soc >= 0) {
+        fill = (s_battery_soc * 11 + 99) / 100;
+    } else if (s_battery_state == BATT_FALLBACK &&
+               s_battery_mv >= 2500 && s_battery_mv <= 4500) {
+        /* 电压粗估 4 档：只是图形等级（黄色示意），不是伪造百分比 */
+        color = COLOR_YELLOW;
+        fill = s_battery_mv >= 4050 ? 11
+             : s_battery_mv >= 3800 ? 8
+             : s_battery_mv >= 3600 ? 5
+             : s_battery_mv >= 3400 ? 2 : 0;
+    }
+    if (fill > 0) draw_pixel_rect(layer, &base, 3, 3, fill, 4, color, 0);
 }
 
 static void action_draw_cb(lv_event_t *event) {
@@ -782,6 +837,16 @@ static void play_tone(tone_id_t tone) {
     xQueueOverwrite(s_audio_queue, &value);
 }
 
+/* 进入"快速观察"阶段：重置纯逻辑状态机，10s 窗口内 250ms 轮询 */
+static void battery_enter_wait_ready(uint64_t now) {
+    bg_init(&s_bg);
+    s_battery_state = BATT_WAIT_READY;
+    s_battery_soc = -1;
+    s_batt_deadline_ms = now + BATT_READY_WINDOW_MS;
+    s_batt_next_poll_ms = now + BATT_FAST_POLL_MS;
+    s_batt_logged_first = false;
+}
+
 void demo_pomodoro_prepare(bool audio_ok, bool battery_ok) {
     if (s_prepared) return;
     s_prepared = true;
@@ -790,13 +855,12 @@ void demo_pomodoro_prepare(bool audio_ok, bool battery_ok) {
     pomodoro_store_init(&s_model, &s_stats, &s_anchor_unix);
     pomodoro_time_init(s_anchor_unix);
 
-    /* 电量计 boot 瞬间可能未就绪：一次 init 失败不判死刑，
-     * 按 1s/3s/10s 后转 60s 周期在 timer 里重试（见 battery_schedule_retry）。 */
-    s_battery_online = battery_ok;
-    if (s_battery_online) {
-        s_battery_soc = bsp_battery_soc();
-        ESP_LOGI(TAG, "Battery gauge online, initial SOC=%d", s_battery_soc);
+    /* 电池状态机启动：在线则进入 10s 快速观察（连续 3 可信样本才 READY）；
+     * 0x63 无应答按 1s/3s/10s 后转 60s 周期重试 init（见 battery_poll）。 */
+    if (battery_ok) {
+        battery_enter_wait_ready(now_ms());
     } else {
+        s_battery_state = BATT_UNAVAILABLE;
         s_batt_retry_count = 0;
         s_batt_retry_ms = now_ms() + 1000;
         ESP_LOGW(TAG, "Battery init failed; retry at 1s/3s/10s then 60s");
@@ -1053,11 +1117,13 @@ static void refresh_ui(void) {
                               s_model.pomodoro_round + 1);
     }
 
-    if (s_battery_soc >= 0) {
-        lv_label_set_text_fmt(s_battery_label, "%d%%%s", s_battery_soc,
-                              s_model.muted ? " M" : "");
-    } else {
-        lv_label_set_text_fmt(s_battery_label, "--%%%s", s_model.muted ? " M" : "");
+    {
+        char buf[24];
+        battery_text(buf, sizeof(buf));
+        if (s_model.muted) {
+            snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), " M");
+        }
+        lv_label_set_text(s_battery_label, buf);
     }
     lv_obj_align(s_battery_label, LV_ALIGN_TOP_RIGHT, -27, 5);
     if (s_battery_icon) lv_obj_invalidate(s_battery_icon);
@@ -1143,6 +1209,160 @@ static void battery_schedule_retry(uint64_t now) {
                                             : 60ULL * 1000;
     s_batt_retry_count++;
     s_batt_retry_ms = now + delay;
+}
+
+/* 采样一次 SOC raw + VCELL，喂给纯逻辑判定；电压做 EMA 平滑。 */
+static void batt_sample(void) {
+    uint16_t raw = 0;
+    bool ok = bsp_battery_soc_raw(&raw);
+    int mv = bsp_battery_mv();
+    if (mv > 0) {
+        s_battery_mv = (s_battery_mv < 0) ? mv : (s_battery_mv * 3 + mv) / 4;
+        s_batt_mv_fail_streak = 0;
+    } else if (++s_batt_mv_fail_streak >= 3) {
+        s_battery_mv = -1;   /* I2C 持续失败：清掉冻结的电压显示，回到 --% */
+    }
+
+    unsigned x1000 = ((raw >> 8) & 0xFF) * 1000U +
+                     (unsigned)(((raw & 0xFF) * 1000U + 128U) / 256U);
+    bool plausible = bg_sample_plausible(ok, raw, mv);
+    bg_state_t prev = s_bg.state;
+    bool changed = bg_feed(&s_bg, ok, raw, mv);
+
+    if (!s_batt_logged_first) {
+        /* 每轮 WAIT_READY 只打一次首样本详情，避免高频刷屏 */
+        s_batt_logged_first = true;
+        const char *reason = !ok ? "i2c-fail"
+                            : !plausible ? ((((raw >> 8) & 0xFF) > 100)
+                                             ? "soc-invalid" : "startup-zero")
+                                          : "candidate";
+        ESP_LOGI(TAG, "BATTERY raw=0x%04X soc=%u.%03u%% v=%dmV state=WAIT reason=%s",
+                 raw, x1000 / 1000, x1000 % 1000, mv, reason);
+    } else if (plausible && prev != BG_READY) {
+        if (s_bg.state == BG_READY) {
+            ESP_LOGI(TAG, "BATTERY raw=0x%04X soc=%u.%03u%% v=%dmV valid=%d/%d -> READY",
+                     raw, x1000 / 1000, x1000 % 1000, mv,
+                     BG_READY_STREAK, BG_READY_STREAK);
+        } else {
+            ESP_LOGI(TAG, "BATTERY raw=0x%04X soc=%u.%03u%% v=%dmV valid=%u/%d",
+                     raw, x1000 / 1000, x1000 % 1000, mv,
+                     s_bg.valid_streak, BG_READY_STREAK);
+        }
+    } else if (changed && s_bg.state == BG_FALLBACK) {
+        ESP_LOGW(TAG, "BATTERY raw=0x%04X v=%dmV -> FALLBACK reason=invalid-streak",
+                 raw, mv);
+    }
+
+    if (changed) {
+        s_battery_soc = bg_display_soc(&s_bg);
+        refresh_ui();
+    }
+}
+
+static batt_state_t batt_state_from_bg(void) {
+    switch (s_bg.state) {
+    case BG_READY:    return BATT_READY;
+    case BG_FALLBACK: return BATT_FALLBACK;
+    default:          return BATT_WAIT_READY;
+    }
+}
+
+/* FALLBACK 态电压文案节流：平滑值变化 ≥100mV 立即刷，
+ * 否则最快 30s 一次。避免 4.08→4.12 级别的抖动重绘。 */
+static void batt_volt_ui_update(uint64_t now) {
+    if (s_battery_state != BATT_FALLBACK || s_battery_mv < 0) return;
+    int diff = s_battery_mv - s_batt_volt_shown;
+    if (diff < 0) diff = -diff;
+    if (s_batt_volt_shown >= 0 && diff < 100 &&
+        now - s_batt_volt_ui_ms < 30ULL * 1000) return;
+    s_batt_volt_shown = s_battery_mv;
+    s_batt_volt_ui_ms = now;
+    refresh_ui();
+}
+
+/* 有证据的 gauge 恢复：仅当 CONFIG(0x08) 偏离正常模式 0x00（如重回睡眠 0xF0
+ * 或挂起 0x30）才 restart；SOC 长期为 0x0000 不构成证据——无脑 restart 只会让
+ * 芯片反复回到 startup 默认值。限额 2 次/boot，60s cooldown。 */
+static void batt_maybe_restart(uint64_t now) {
+    if (s_batt_restart_count >= BATT_MAX_RESTARTS) return;
+    if (s_batt_recovery_ms != 0 &&
+        now - s_batt_recovery_ms < BATT_RESTART_COOLDOWN_MS) return;
+
+    bsp_battery_diag_t d;
+    if (!bsp_battery_diag(&d)) return;
+    if (d.config == 0x00) return;
+
+    ESP_LOGW(TAG, "BATTERY CONFIG=0x%02X 非正常模式，recovery restart %u/%d",
+             d.config, s_batt_restart_count + 1, BATT_MAX_RESTARTS);
+    if (bsp_battery_restart() == ESP_OK) {
+        s_batt_restart_count++;
+        s_batt_recovery_ms = now;
+        battery_enter_wait_ready(now);
+    }
+}
+
+/* 进入 FALLBACK：记录当前平滑电压为已显示值（首帧立即生效） */
+static void batt_fallback_begin(uint64_t now) {
+    s_batt_volt_shown = s_battery_mv;
+    s_batt_volt_ui_ms = now;
+    s_batt_next_poll_ms = now + BATT_FALLBACK_POLL_MS;
+}
+
+/* 电池状态机轮询（基于真实时间；GO WORK 动画会临时切 40ms 帧率）。
+ * UNAVAILABLE: 重试 init；WAIT_READY: 250ms×10s 观察，连续 3 可信 → READY；
+ * READY: 30s 轮询，连续 3 异常 → FALLBACK；
+ * FALLBACK: 显示平滑电压，5s 低频读 SOC（连续 3 可信才回 READY），
+ *           仅 CONFIG 异常等有证据时 restart（≤2 次/boot）。 */
+static void battery_poll(uint64_t now) {
+    switch (s_battery_state) {
+    case BATT_UNAVAILABLE:
+        if (now >= s_batt_retry_ms) {
+            battery_schedule_retry(now);
+            if (bsp_battery_init() == ESP_OK) battery_enter_wait_ready(now);
+        }
+        break;
+
+    case BATT_WAIT_READY:
+        if (now < s_batt_next_poll_ms) break;
+        s_batt_next_poll_ms = now + BATT_FAST_POLL_MS;
+        batt_sample();
+        s_battery_state = batt_state_from_bg();
+        if (s_battery_state == BATT_READY) {
+            s_batt_next_poll_ms = now + BATT_READY_POLL_MS;
+        } else if (now >= s_batt_deadline_ms) {
+            /* 观察窗口耗尽：不判芯片坏，转电压 fallback 后台继续低频等 */
+            bg_force_fallback(&s_bg);
+            s_battery_state = BATT_FALLBACK;
+            batt_fallback_begin(now);
+            ESP_LOGW(TAG, "BATTERY state=FALLBACK reason=ready-timeout v=%dmV",
+                     s_battery_mv);
+            refresh_ui();
+        }
+        break;
+
+    case BATT_READY:
+        if (now < s_batt_next_poll_ms) break;
+        s_batt_next_poll_ms = now + BATT_READY_POLL_MS;
+        batt_sample();
+        s_battery_state = batt_state_from_bg();
+        if (s_battery_state == BATT_FALLBACK) {
+            batt_fallback_begin(now);
+        }
+        break;
+
+    case BATT_FALLBACK:
+        if (now < s_batt_next_poll_ms) break;
+        s_batt_next_poll_ms = now + BATT_FALLBACK_POLL_MS;
+        batt_sample();
+        s_battery_state = batt_state_from_bg();
+        if (s_battery_state == BATT_READY) {
+            s_batt_next_poll_ms = now + BATT_READY_POLL_MS;
+        } else {
+            batt_maybe_restart(now);
+            batt_volt_ui_update(now);
+        }
+        break;
+    }
 }
 
 static void timer_cb(lv_timer_t *timer) {
@@ -1249,34 +1469,8 @@ static void timer_cb(lv_timer_t *timer) {
         }
     }
 
-    /* 电池：boot init 失败可运行时恢复（1s/3s/10s 后 60s 周期重试 init）；
-     * online 后每 30s 读 SOC，读失败保留 --% 稍后重试，不清 UI。
-     * 轮询基于真实时间而非 tick 计数（GO WORK 动画会临时切 40ms 帧率）。 */
-    if (!s_battery_online) {
-        if (time_ms >= s_batt_retry_ms) {
-            battery_schedule_retry(time_ms);
-            if (bsp_battery_init() == ESP_OK) {
-                s_battery_online = true;
-                s_battery_soc = bsp_battery_soc();
-                ESP_LOGI(TAG, "Battery gauge online, SOC=%d", s_battery_soc);
-                refresh_ui();
-            }
-        }
-    } else if (time_ms - s_last_battery_ms >= 30ULL * 1000) {
-        s_last_battery_ms = time_ms;
-        int soc = bsp_battery_soc();
-        if (soc < 0) {
-            ESP_LOGW(TAG, "Battery SOC read failed");
-            if (s_battery_soc != -1) {
-                s_battery_soc = -1;
-                refresh_ui();
-            }
-        } else if (soc != s_battery_soc) {
-            s_battery_soc = soc;
-            ESP_LOGI(TAG, "Battery SOC=%d", soc);
-            refresh_ui();
-        }
-    }
+    /* 电池状态机轮询（见 battery_poll） */
+    battery_poll(time_ms);
 }
 
 /* ---------- 进出与按键 ---------- */
@@ -1289,7 +1483,6 @@ void demo_pomodoro_enter(void) {
     s_save_bucket = UINT32_MAX;
     s_last_time_status = pomodoro_time_status();
     s_last_hourly_ms = now_ms();
-    s_last_battery_ms = now_ms();
     s_last_wifi_check_ms = now_ms();
     s_wifi_banner_sig = 0xFF;
     s_bl_scene = bl_scene_from_state();
@@ -1299,7 +1492,6 @@ void demo_pomodoro_enter(void) {
     s_gw.frame = GW_FRAME_REST;
     s_gw_active = false;
     s_gw_next_ms = now_ms() + 2000;
-    if (s_battery_online) s_battery_soc = bsp_battery_soc();
 
     s_scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s_scr, lv_color_hex(COLOR_BG), 0);

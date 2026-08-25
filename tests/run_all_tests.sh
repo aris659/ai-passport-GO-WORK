@@ -11,5 +11,6 @@ run 'tests/test_pomodoro_date.c main/pomodoro_date.c' test_date
 run 'tests/test_pomodoro_stats.c main/pomodoro_stats.c main/pomodoro_date.c' test_stats
 run 'tests/test_pomodoro_blob.c main/pomodoro_blob.c main/pomodoro_date.c main/pomodoro_stats.c main/pomodoro_model.c' test_blob
 run 'tests/test_ui_pixel_math.c main/ui_pixel_math.c' test_pixel
+run 'tests/test_battery_gauge.c main/battery_gauge.c' test_battery_gauge
 run 'tests/test_wifi_prov.c main/wifi_prov_util.c' test_wifi_prov
 echo ALL_TEST_PASS

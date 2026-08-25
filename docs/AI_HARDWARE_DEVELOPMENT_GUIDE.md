@@ -176,14 +176,19 @@ Audio demo 使用独立 4 KB 栈任务：OK 播放 1 秒 1 kHz 方波，UP 录 3
 
 ## 9. CW2017 电池计
 
-CW2017 在共享 I2C 地址 0x63。初始化读取 VERSION 确认在线，将 CONFIG 写为 0x00 进入正常模式，等待 100 ms 后使用芯片自带 Li-Poly profile。仓库刻意不写自定义电池 profile，因为开源用户的电池可能不同。
+CW2017 在共享 I2C 地址 0x63。寄存器事实以 CellWise CW2017-DS V1.1 数据手册为准：VERSION 0x00（应答 0xA0）、VCELL 0x02–0x03（14 bit，312.5 µV/LSB）、SOC 0x04–0x05（高字节为整数百分比）、CONFIG 0x08（上电默认 0xF0 = 睡眠）、SOC_ALERT 0x0B（默认 0x14）。CW2017 的寄存器表中没有 CW2015 那种从 0x10 开始的 BATINFO 主机可写区：芯片使用自带 Li-Poly profile 按 OCV 估算 SOC，主机侧不存在“写 profile”步骤，也无法通过寄存器读回 profile。
 
-- SOC：读 0x04–0x05，仅返回高字节整数百分比；大于 100 视为未就绪并返回 `-1`。
+关键流程：芯片上电停在睡眠模式，必须按数据手册两步唤醒——先写 `0x30` 到 0x08 清睡眠位，再写 `0x00` 清复位位；芯片随后复位固件并基于最新电池状态重算 SOC。只写一次 `0x00` 不是数据手册流程。`bsp_battery_init()` 负责探测 VERSION、打印诊断日志并执行该序列；返回 `ESP_OK` 仅代表芯片在线应答，SOC 首次就绪需要数秒，就绪判定交给上层轮询。
+
+- SOC：`bsp_battery_soc()` 读 0x04–0x05 高字节整数百分比；大于 100 视为未就绪并返回 `-1`。`bsp_battery_soc_raw()` 返回完整 16 bit 原始值（高字节整数 % + 低字节 1/256 %），供 readiness 判定使用。
 - 电压：读 0x02–0x03 的 14 bit 值，换算为 `raw × 312.5 µV`，API 返回 mV。
-- 事务超时当前为 100 ms，设备时钟为 100 kHz。
+- 诊断：`bsp_battery_diag()` 返回 version/config/soc_alert/soc_raw/vcell_raw/电压快照；启动日志与 Battery demo 页使用，异常时日志会明确给出 `CW2017 online, voltage=xxxxmV, SOC not ready`。
+- 恢复：`bsp_battery_restart()` 重走 0x30→0x00 序列；只在 CONFIG(0x08) 偏离正常 0x00（如重回睡眠 0xF0）等有寄存器证据时调用，单次 boot 限额 2 次、60 秒 cooldown。SOC 长期为 0x0000 不构成 restart 证据——无脑复位只会让芯片反复回到上电默认值。
+- 番茄钟侧状态机（就绪判定纯逻辑在 `main/battery_gauge.c`，host 可测）：UNAVAILABLE（重试 init，1s/3s/10s 后 60s 周期）→ WAIT_READY（250 ms 轮询，10 s 观察窗）→ READY（30 s 轮询）⇄ FALLBACK（5 s 低频轮询）。进入 READY 需要连续 3 个可信样本；`raw=0x0000 且 VCELL≥3600 mV`（上电默认值与满电矛盾）视为不可信，绝不显示 0%。FALLBACK 显示 EMA 平滑后的实测电压（如 `4.10V`，≥100 mV 变化或 30 s 才刷新），图标按电压 4 档黄色粗估填充，不把电压换算成看似精确的百分比。
+- 事务超时当前为 100 ms，设备时钟为 100 kHz；关键寄存器写入失败会记日志并向上返回错误，不使用 `ESP_ERROR_CHECK` 中止。
 - 芯片不应答时初始化返回 `ESP_ERR_NOT_FOUND`，菜单标记失败，但整机继续运行。
 
-SOC 准确度取决于电芯与 profile 的匹配程度。本驱动给出的是电量计读数，不等于实验室标定结果。若产品需要准确 SOC，必须取得电芯参数、CW2017 数据手册和供应商 profile，并完成完整充放电验证。
+SOC 准确度取决于电芯与自带 profile 的匹配程度。本驱动给出的是电量计读数，不等于实验室标定结果。若产品需要准确 SOC，必须取得电芯参数、CW2017 数据手册和供应商 profile，并完成完整充放电验证。
 
 ## 10. Flash、控制台和资源预算
 
@@ -400,7 +405,7 @@ idf.py flash monitor
 | 音频快/慢或变调 | 格式变化是否执行 close/open、采样率/MCLK，勿手改时钟寄存器 |
 | 录音全零 | `no_dac_ref` 是否为 true、DIN GPIO4、麦克风通路和输入增益 |
 | 录音缓冲分配失败 | C3 无 PSRAM；缩短录音或改流式，检查 largest free block |
-| 电量显示 `--` | 0x63 是否应答、SOC 是否读到 >100/0xFF、profile/启动等待 |
+| 电量显示 `--` | 0x63 是否应答、CONFIG(0x08) 是否卡在 0xF0/非 0x00、SOC raw 是否 >100、启动诊断日志（version/mode/soc_raw/vcell）、8s 就绪窗口与电压 fallback 日志 |
 | 加大 UI 后 I2S NO_MEM | LCD 双缓冲/LVGL pool 与 I2S DMA 争夺内部 RAM |
 
 ## 15. AI 提交前自检

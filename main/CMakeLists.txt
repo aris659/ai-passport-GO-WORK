@@ -13,6 +13,7 @@ idf_component_register(
          "demo_audio.c"
          "demo_battery.c"
          "demo_pomodoro.c"
+         "battery_gauge.c"
          "pomodoro_model.c"
          "pomodoro_store.c"
          "pomodoro_date.c"
